@@ -1,0 +1,1771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Among Ed</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <style>
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-5px); }
+            75% { transform: translateX(5px); }
+        }
+        .shake { animation: shake 0.3s ease-in-out; }
+
+        .slide-up-anim { animation: slideUp 0.3s ease-out; }
+        @keyframes slideUp {
+            from { transform: translateY(100%); }
+            to { transform: translateY(0); }
+        }
+
+        .fade-in { animation: fadeIn 1s ease-in forwards; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        .drama-text { animation: dramaScale 3s ease-out forwards; }
+        @keyframes dramaScale { 
+            0% { transform: scale(0.8); opacity: 0; } 
+            20% { transform: scale(1); opacity: 1; }
+            80% { transform: scale(1.1); opacity: 1; }
+            100% { transform: scale(1.5); opacity: 0; }
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+        
+        /* Range Slider Styling for Volume */
+        input[type=range] {
+            -webkit-appearance: none; 
+            background: transparent; 
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 12px;
+            width: 12px;
+            border-radius: 50%;
+            background: #22d3ee;
+            margin-top: -4px;
+            cursor: pointer;
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: #475569;
+            border-radius: 2px;
+        }
+    </style>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "lucide-react": "https://esm.sh/lucide-react@0.292.0"
+        }
+    }
+    </script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useRef, useMemo } from 'react';
+        import { createRoot } from 'react-dom/client';
+        
+        import { 
+            Shield, Users, Zap, Skull, Eye, EyeOff, FileText, Radio, AlertTriangle, 
+            Ghost, Settings, CheckCircle, XCircle, Lock, Unlock, UserX, Gift,
+            UserPlus, Trash2, Key, Upload, Download, FileDown, Library, Play, Pause,
+            Save, HelpCircle, ExternalLink, Lock as LockIcon, Unlock as UnlockIcon,
+            MousePointerClick, Sliders, Edit, PlusCircle, Volume2, VolumeX,
+            Repeat, Shuffle, Music, Star, UploadCloud
+        } from 'lucide-react';
+
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            onAuthStateChanged,
+            signInWithCustomToken
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, collection, doc, setDoc, addDoc, updateDoc, 
+            onSnapshot, increment, getDoc, getDocs, writeBatch, serverTimestamp, 
+            deleteDoc, deleteField
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Configuration ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyCPLhpAjOdIprqqcLXX5QvO785iteHyRuM", 
+            authDomain: "among-ed.firebaseapp.com",
+            projectId: "among-ed",
+            storageBucket: "among-ed.firebasestorage.app",
+            messagingSenderId: "928438234140",
+            appId: "1:928438234140:web:7d3411f93381b2c5b743d9"
+        };
+        const appId = 'class-1';
+
+        const GAME_ID = 'main_game_room'; 
+        const GAMES_PATH = ['artifacts', appId, 'public', 'data', 'games'];
+        const ROSTER_PATH = ['artifacts', appId, 'public', 'data', 'roster'];
+        const QUESTION_SETS_PATH = ['artifacts', appId, 'public', 'data', 'question_sets'];
+        const MUSIC_PATH = ['artifacts', appId, 'public', 'data', 'music_library'];
+
+        // Default Dark Ambient Space Track
+        const DEFAULT_TRACK = {
+            id: 'default_ambient',
+            name: 'Deep Space (Default)',
+            url: 'https://cdn.pixabay.com/audio/2022/10/18/audio_31c2739e64.mp3',
+            isDefault: true
+        };
+
+        const BTN_COLORS = [
+            "bg-blue-600 hover:bg-blue-500",
+            "bg-emerald-600 hover:bg-emerald-500",
+            "bg-purple-600 hover:bg-purple-500",
+            "bg-orange-600 hover:bg-orange-500"
+        ];
+
+        const DEFAULT_QUESTIONS = [
+            { q: "What is the capital of France?", a: ["Paris", "London", "Berlin", "Rome"], correct: 0 },
+            { q: "What is 5 + 7?", a: ["10", "11", "12", "13"], correct: 2 },
+            { q: "Which planet is known as the Red Planet?", a: ["Venus", "Mars", "Jupiter", "Saturn"], correct: 1 },
+        ];
+
+        const DEFAULT_COSTS = {
+            peek: 7, private: 7, public: 15, emergency: 10,
+            remove: 10, fake: 6, unclear: 15, disguise: 15
+        };
+
+        const CSV_TEMPLATE = `"Among Ed Import",,,,,,,,
+Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
+
+        // --- Helpers ---
+        const getGameRef = (db) => doc(db, ...GAMES_PATH, GAME_ID);
+        const getPlayerRef = (db, uid) => doc(db, ...GAMES_PATH, GAME_ID, 'players', uid);
+        const getRosterRef = (db, name) => doc(db, ...ROSTER_PATH, name.toLowerCase().trim());
+
+        const parseCSV = (text) => {
+            const rows = [];
+            let row = [];
+            let col = "";
+            let inQuote = false;
+            
+            for (let i = 0; i < text.length; i++) {
+                const c = text[i];
+                const next = text[i+1];
+                
+                if (c === '"') {
+                    if (inQuote && next === '"') {
+                        col += '"';
+                        i++; 
+                    } else {
+                        inQuote = !inQuote;
+                    }
+                } else if (c === ',' && !inQuote) {
+                    row.push(col.trim());
+                    col = "";
+                } else if ((c === '\r' || c === '\n') && !inQuote) {
+                    if (col || row.length > 0) row.push(col.trim());
+                    if (row.length > 0) rows.push(row);
+                    row = [];
+                    col = "";
+                    if (c === '\r' && next === '\n') i++;
+                } else {
+                    col += c;
+                }
+            }
+            if (col || row.length > 0) {
+                row.push(col.trim());
+                rows.push(row);
+            }
+            return rows;
+        };
+
+        // --- Main App ---
+        function App() {
+            const [user, setUser] = useState(null);
+            const [role, setRole] = useState('student'); 
+            const [name, setName] = useState('');
+            const [password, setPassword] = useState('');
+            const [showPassword, setShowPassword] = useState(false);
+            const [joined, setJoined] = useState(false);
+            const [auth, setAuth] = useState(null);
+            const [db, setDb] = useState(null);
+            const [errorMsg, setErrorMsg] = useState('');
+            const [loginTab, setLoginTab] = useState('student');
+
+            useEffect(() => {
+                const urlParams = new URLSearchParams(window.location.search);
+                if (urlParams.get('mode') === 'feed') {
+                    setRole('projector');
+                    setJoined(true);
+                }
+
+                const app = initializeApp(firebaseConfig);
+                const authInst = getAuth(app);
+                const dbInst = getFirestore(app);
+                setAuth(authInst);
+                setDb(dbInst);
+                signInAnonymously(authInst);
+                return onAuthStateChanged(authInst, setUser);
+            }, []);
+
+            const handleLogin = async () => {
+                if (!name && loginTab === 'student') return setErrorMsg("Name required");
+                if (!password) return setErrorMsg("Password required");
+                
+                try {
+                    if (loginTab === 'teacher') {
+                        const snap = await getDoc(getGameRef(db));
+                        const serverPass = snap.exists() ? (snap.data().teacherPassword || 'admin') : 'admin';
+                        if (password === serverPass) { setRole('teacher'); setJoined(true); }
+                        else setErrorMsg("Invalid Command Code");
+                    } else {
+                        // Check Lock
+                        const gameSnap = await getDoc(getGameRef(db));
+                        if (gameSnap.exists() && gameSnap.data().isLocked) {
+                            return setErrorMsg("Game is locked. No new cadets.");
+                        }
+
+                        const snap = await getDoc(getRosterRef(db, name));
+                        if (!snap.exists()) setErrorMsg("Cadet not found.");
+                        else if (snap.data().password === password) { setRole('student'); setJoined(true); }
+                        else setErrorMsg("Access Denied");
+                    }
+                } catch (e) { setErrorMsg("Error: " + e.message); }
+            };
+
+            if (!user) return <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">Initializing Comms...</div>;
+
+            if (role === 'projector') return <ProjectorView db={db} />;
+
+            if (!joined) {
+                return (
+                    <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+                        <div className="bg-slate-800 p-8 rounded-xl shadow-2xl max-w-md w-full border border-slate-700">
+                            <h1 className="text-3xl font-bold text-cyan-400 mb-6 text-center flex items-center gap-2">
+                                <Radio className="w-8 h-8" /> Among Ed
+                            </h1>
+                            <div className="flex mb-6 bg-slate-900 rounded p-1">
+                                <button onClick={() => setLoginTab('student')} className={`flex-1 py-2 rounded text-sm font-bold ${loginTab==='student'?'bg-cyan-600 text-white':'text-slate-400'}`}>Cadet</button>
+                                <button onClick={() => setLoginTab('teacher')} className={`flex-1 py-2 rounded text-sm font-bold ${loginTab==='teacher'?'bg-slate-700 text-white':'text-slate-400'}`}>Teacher</button>
+                            </div>
+                            <div className="space-y-4">
+                                {loginTab === 'student' && <input className="w-full p-3 rounded bg-slate-900 text-white border border-slate-600" placeholder="Cadet Name" value={name} onChange={e=>setName(e.target.value)} />}
+                                <div className="relative">
+                                    <input 
+                                        className="w-full p-3 rounded bg-slate-900 text-white border border-slate-600 pr-10" 
+                                        type={showPassword ? "text" : "password"} 
+                                        placeholder={loginTab==='teacher'?'Command Code':'Password'} 
+                                        value={password} 
+                                        onChange={e=>setPassword(e.target.value)} 
+                                    />
+                                    <button 
+                                        type="button"
+                                        onClick={() => setShowPassword(!showPassword)}
+                                        className="absolute right-3 top-3.5 text-slate-400 hover:text-slate-200"
+                                    >
+                                        {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+                                    </button>
+                                </div>
+                                {errorMsg && <div className="text-red-400 text-sm bg-red-900/20 p-2 rounded">{errorMsg}</div>}
+                                <button onClick={handleLogin} className="w-full py-3 rounded-lg font-bold bg-cyan-600 hover:bg-cyan-500 text-white">Log In</button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            return role === 'teacher' ? <TeacherDashboard user={user} db={db} /> : <StudentInterface user={user} userName={name} db={db} />;
+        }
+
+        // --- Projector View (Public Feed Only) ---
+        function ProjectorView({ db }) {
+            const [feed, setFeed] = useState([]);
+            const [gameState, setGameState] = useState(null);
+            const [players, setPlayers] = useState({});
+
+            useEffect(() => {
+                const unsubFeed = onSnapshot(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), (snap) => {
+                    const f = [];
+                    snap.forEach(doc => f.push({id: doc.id, ...doc.data()}));
+                    f.sort((a, b) => b.timestamp?.seconds - a.timestamp?.seconds);
+                    setFeed(f);
+                });
+                const unsubGame = onSnapshot(getGameRef(db), (snap) => {
+                    if(snap.exists()) setGameState(snap.data());
+                });
+                const unsubP = onSnapshot(collection(db, ...GAMES_PATH, GAME_ID, 'players'), (s) => {
+                    const p = {}; s.forEach(d => p[d.id] = {id:d.id, ...d.data()}); setPlayers(p);
+                });
+                return () => { unsubFeed(); unsubGame(); unsubP(); };
+            }, [db]);
+
+            if (gameState?.winner) return <WinScreen winner={gameState.winner} players={players} />;
+            if (gameState?.phase === 'Ejecting') return <EjectionSequence data={gameState.ejectionData} isPublic={true} />;
+
+            return (
+                <div className="min-h-screen bg-slate-950 text-white p-8">
+                    <div className="max-w-4xl mx-auto">
+                        <div className="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
+                            <h1 className="text-4xl font-bold text-cyan-400 flex items-center gap-3"><Radio size={40}/> Public Communications</h1>
+                            <div className="bg-slate-800 px-6 py-3 rounded-lg border border-slate-600 text-center">
+                                <div className="text-xs text-slate-400 uppercase tracking-widest">Investigations Remaining</div>
+                                <div className="text-3xl font-mono text-white font-bold">{gameState?.config?.investigationsLeft ?? '-'}</div>
+                            </div>
+                        </div>
+                        <div className="space-y-4">
+                            {feed.map(f => (
+                                <div key={f.id} className="text-2xl p-6 bg-slate-900 rounded-xl border-l-4 border-cyan-500 shadow-lg animate-fade-in">
+                                    <div className="flex justify-between items-center mb-2">
+                                        <span className="text-cyan-400 font-bold uppercase tracking-wider text-sm opacity-75">{f.source}</span>
+                                        <span className="text-sm text-slate-500 font-mono">
+                                            {f.timestamp?.seconds ? new Date(f.timestamp.seconds * 1000).toLocaleTimeString() : ''}
+                                        </span>
+                                    </div>
+                                    <div className="text-slate-200">{f.message}</div>
+                                </div>
+                            ))}
+                            {feed.length === 0 && <div className="text-center text-slate-600 text-xl italic mt-20">Waiting for incoming transmissions...</div>}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // --- Screens & Animations ---
+        function WinScreen({ winner, players }) {
+            const isImp = winner === 'Imposters';
+            const imposterNames = Object.values(players || {})
+                .filter(p => p.role === 'Imposter')
+                .map(p => p.name)
+                .join(", ");
+
+            return (
+                <div className={`fixed inset-0 z-50 flex flex-col items-center justify-center bg-black text-center ${isImp ? 'text-red-500' : 'text-cyan-400'}`}>
+                    <h1 className="text-6xl md:text-9xl font-black uppercase tracking-widest animate-pulse mb-8">{winner} Win!</h1>
+                    {isImp ? <Skull size={128} className="mb-8 mx-auto"/> : <Shield size={128} className="mb-8 mx-auto"/>}
+                    {isImp && (
+                        <div className="text-2xl text-white mt-4">
+                            <span className="text-slate-400">The Imposters were:</span>
+                            <div className="font-bold mt-2 text-red-500 text-4xl">{imposterNames}</div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function EjectionSequence({ data, isPublic, onResume, isTeacher }) {
+            const [stage, setStage] = useState(0); 
+            const [canResume, setCanResume] = useState(false);
+
+            useEffect(() => {
+                const t1 = setTimeout(() => setStage(1), 3000);
+                const t2 = setTimeout(() => setStage(2), 7000);
+                const t3 = setTimeout(() => {
+                    setStage(3);
+                    setTimeout(() => setCanResume(true), 5000); 
+                }, 8500);
+                return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+            }, []);
+
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black overflow-hidden text-white cursor-default" onClick={isTeacher && canResume ? onResume : undefined}>
+                    <div className="absolute inset-0 opacity-50 bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] animate-pulse pointer-events-none"></div>
+                    
+                    {stage === 0 && (
+                        <div className="text-center">
+                            <h1 className="text-6xl font-black uppercase tracking-widest animate-pulse">The votes are in...</h1>
+                        </div>
+                    )}
+
+                    {stage === 1 && (
+                        <div className="text-center relative z-10">
+                            <h1 className="text-6xl md:text-8xl font-black text-red-500 uppercase tracking-tighter drama-text">{data.name}</h1>
+                            <h2 className="text-4xl mt-4 uppercase">Was Voted Out!</h2>
+                            <Ghost className="w-32 h-32 mx-auto mt-8 animate-bounce text-slate-500" />
+                        </div>
+                    )}
+
+                    {stage === 2 && <div className="absolute inset-0 bg-black z-50"></div>}
+
+                    {stage === 3 && (
+                        <div className="text-center relative z-10 fade-in">
+                            <h2 className="text-3xl text-slate-400 mb-4">{data.name} was...</h2>
+                            <h1 className={`text-6xl md:text-9xl font-black uppercase ${data.role === 'Imposter' ? 'text-red-600' : 'text-cyan-500'}`}>
+                                A {data.role}!
+                            </h1>
+                            <div className="mt-12 text-slate-500 animate-pulse flex items-center justify-center gap-2">
+                                {isTeacher ? (
+                                    canResume ? (
+                                        <button onClick={onResume} className="bg-slate-700 text-white px-6 py-3 rounded-full font-bold hover:bg-slate-600 transition-colors flex items-center gap-2">
+                                            <MousePointerClick size={20} /> Click to Resume Game
+                                        </button>
+                                    ) : (
+                                        <span className="text-sm opacity-50">Wait for signal...</span>
+                                    )
+                                ) : (
+                                    <span className="text-xl">Waiting for Teacher to continue...</span>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function IntroSequence({ role, onClose }) {
+            const [count, setCount] = useState(3);
+            const [showRole, setShowRole] = useState(false);
+
+            useEffect(() => {
+                if (count > 0) {
+                    const t = setTimeout(() => setCount(c => c - 1), 1000);
+                    return () => clearTimeout(t);
+                } else {
+                    setShowRole(true);
+                }
+            }, [count]);
+
+            return (
+                <div className="fixed inset-0 z-50 bg-slate-950 flex items-center justify-center" onClick={() => showRole && onClose()}>
+                    {count > 0 ? (
+                        <div className="text-9xl font-black text-white animate-ping">{count}</div>
+                    ) : (
+                        <div className="text-center animate-fade-in cursor-pointer p-10 bg-slate-900 border-2 border-slate-700 rounded-2xl shadow-2xl">
+                            <p className="text-slate-400 uppercase tracking-widest mb-4">Your assignment</p>
+                            <h1 className={`text-6xl font-black uppercase mb-8 ${role === 'Imposter' ? 'text-red-500' : 'text-cyan-400'}`}>
+                                {role}
+                            </h1>
+                            <p className="text-sm text-slate-500 animate-pulse">(Click anywhere to begin)</p>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // --- Teacher Dashboard ---
+        function TeacherDashboard({ user, db }) {
+            const [gameState, setGameState] = useState(null);
+            const [players, setPlayers] = useState({});
+            const [config, setConfig] = useState({ 
+                imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, costs: DEFAULT_COSTS 
+            });
+            const [showStats, setShowStats] = useState(false);
+            const [view, setView] = useState('game'); 
+            
+            // --- MUSIC PLAYER STATE ---
+            const [musicLibrary, setMusicLibrary] = useState([DEFAULT_TRACK]);
+            const [currentTrack, setCurrentTrack] = useState(DEFAULT_TRACK);
+            const [isPlaying, setIsPlaying] = useState(false);
+            const [isLooping, setIsLooping] = useState(true);
+            const [isShuffling, setIsShuffling] = useState(false);
+            const [volume, setVolume] = useState(0.4);
+            const [isMuted, setIsMuted] = useState(false);
+            const [showMusicManager, setShowMusicManager] = useState(false);
+            const audioRef = useRef(null);
+            
+            // Music Upload/Edit State
+            const [uploadName, setUploadName] = useState('');
+            const [uploadUrl, setUploadUrl] = useState('');
+            const fileInputRefMusic = useRef(null);
+
+            // Roster State
+            const [roster, setRoster] = useState([]);
+            const [newStudentName, setNewStudentName] = useState('');
+            const [newStudentPass, setNewStudentPass] = useState('');
+            const [newTeacherPass, setNewTeacherPass] = useState('');
+
+            // Library State
+            const [libraryOpen, setLibraryOpen] = useState(false);
+            const [questionSets, setQuestionSets] = useState([]);
+            const [importMode, setImportMode] = useState(false);
+            const [newSetName, setNewSetName] = useState('');
+            const fileInputRef = useRef(null);
+
+            const [feed, setFeed] = useState([]);
+            const [showCostEditor, setShowCostEditor] = useState(false);
+            const [showQuestionEditor, setShowQuestionEditor] = useState(false);
+            const [localQuestions, setLocalQuestions] = useState([]);
+
+            // --- AUDIO LOGIC ---
+            useEffect(() => {
+                audioRef.current = new Audio();
+                audioRef.current.volume = volume;
+                
+                // Initialize with default or saved default
+                const initAudio = async () => {
+                    // Try to find default in library
+                    // This will be handled in the library snapshot listener to be safe
+                }
+                
+                // Event Listener for End of Track
+                audioRef.current.addEventListener('ended', handleTrackEnd);
+
+                return () => {
+                    if (audioRef.current) {
+                        audioRef.current.pause();
+                        audioRef.current.removeEventListener('ended', handleTrackEnd);
+                        audioRef.current = null;
+                    }
+                };
+            }, []);
+
+            // Handle Volume / Mute
+            useEffect(() => {
+                if(audioRef.current) audioRef.current.volume = isMuted ? 0 : volume;
+            }, [volume, isMuted]);
+
+            // Handle Track Changes / Play State
+            useEffect(() => {
+                if(!audioRef.current) return;
+                
+                // If source changed
+                const currentSrc = audioRef.current.src;
+                if(currentTrack.url && currentSrc !== currentTrack.url) {
+                    audioRef.current.src = currentTrack.url;
+                    audioRef.current.load();
+                    if(isPlaying) {
+                        const playPromise = audioRef.current.play();
+                        if(playPromise) playPromise.catch(e => console.log("Play interrupted or waiting interact", e));
+                    }
+                } else {
+                    // Just toggle play/pause
+                    if (isPlaying) {
+                        const playPromise = audioRef.current.play();
+                        if(playPromise) playPromise.catch(e => console.log("Play interrupted", e));
+                    } else {
+                        audioRef.current.pause();
+                    }
+                }
+                // Loop handling: We handle looping manually in handleTrackEnd for better control vs shuffle
+            }, [currentTrack, isPlaying]);
+
+            const handleTrackEnd = () => {
+                if (isLooping) {
+                    audioRef.current.currentTime = 0;
+                    audioRef.current.play();
+                } else if (isShuffling) {
+                    // Pick random track
+                    const randomIdx = Math.floor(Math.random() * musicLibrary.length);
+                    setCurrentTrack(musicLibrary[randomIdx]);
+                } else {
+                    setIsPlaying(false); // Stop if no loop and no shuffle
+                }
+            };
+
+            const togglePlay = () => setIsPlaying(!isPlaying);
+
+            // Music Library Persistence
+            useEffect(() => {
+                const unsubMusic = onSnapshot(collection(db, ...MUSIC_PATH), (snap) => {
+                    const tracks = [DEFAULT_TRACK]; // Always include default
+                    let defaultToPlay = DEFAULT_TRACK;
+                    
+                    snap.forEach(doc => {
+                        const t = { id: doc.id, ...doc.data() };
+                        tracks.push(t);
+                        if(t.isDefault) defaultToPlay = t;
+                    });
+                    
+                    setMusicLibrary(tracks);
+                    
+                    // On first load, if we aren't playing, load the default
+                    if(!audioRef.current.src && defaultToPlay) {
+                        setCurrentTrack(defaultToPlay);
+                    }
+                });
+                return () => unsubMusic();
+            }, [db]);
+
+            const handleMusicUpload = async (e) => {
+                const file = e.target.files[0];
+                if (!file || !uploadName) return alert("Name and File required");
+                
+                if (file.size > 900000) return alert("File too large for this database (Limit: 900KB). Please use a URL for longer tracks.");
+
+                const reader = new FileReader();
+                reader.onload = async (evt) => {
+                    const base64 = evt.target.result;
+                    await addDoc(collection(db, ...MUSIC_PATH), {
+                        name: uploadName,
+                        url: base64,
+                        isDefault: false,
+                        createdAt: serverTimestamp()
+                    });
+                    setUploadName('');
+                    if(fileInputRefMusic.current) fileInputRefMusic.current.value = '';
+                };
+                reader.readAsDataURL(file);
+            };
+
+            const handleUrlAdd = async () => {
+                if (!uploadUrl || !uploadName) return alert("Name and URL required");
+                await addDoc(collection(db, ...MUSIC_PATH), {
+                    name: uploadName,
+                    url: uploadUrl,
+                    isDefault: false,
+                    createdAt: serverTimestamp()
+                });
+                setUploadName('');
+                setUploadUrl('');
+            }
+
+            const deleteTrack = async (id) => {
+                if(id === 'default_ambient') return alert("Cannot delete system default.");
+                if(confirm("Delete this track?")) {
+                    await deleteDoc(doc(db, ...MUSIC_PATH, id));
+                }
+            };
+
+            const setTrackAsDefault = async (targetId) => {
+                // First, unset all
+                // Note: This is a bit heavy for Firestore reads/writes but fine for small libraries
+                const batch = writeBatch(db);
+                
+                musicLibrary.forEach(t => {
+                    if (t.id !== 'default_ambient') {
+                        batch.update(doc(db, ...MUSIC_PATH, t.id), { isDefault: t.id === targetId });
+                    }
+                });
+                
+                await batch.commit();
+                alert("New default set. Refresh to apply on startup.");
+            };
+
+            // --- END AUDIO LOGIC ---
+
+            useEffect(() => {
+                const unsubGame = onSnapshot(getGameRef(db), (snap) => {
+                    if (snap.exists()) {
+                        setGameState(snap.data());
+                        if (snap.data().config) setConfig(prev => ({...prev, ...snap.data().config}));
+                    } else {
+                        setDoc(getGameRef(db), {
+                            status: 'Lobby', phase: 'Lobby',
+                            config: { imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, costs: DEFAULT_COSTS },
+                            teacherPassword: 'admin', questions: DEFAULT_QUESTIONS, isLocked: false
+                        });
+                    }
+                });
+                const unsubPlayers = onSnapshot(collection(db, ...GAMES_PATH, GAME_ID, 'players'), (s) => {
+                    const p = {}; s.forEach(d => p[d.id] = {id:d.id, ...d.data()}); setPlayers(p);
+                });
+                const unsubQS = onSnapshot(collection(db, ...QUESTION_SETS_PATH), (snap) => {
+                    const qs = [];
+                    snap.forEach(doc => qs.push({id: doc.id, ...doc.data()}));
+                    qs.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+                    setQuestionSets(qs);
+                });
+                const unsubRoster = onSnapshot(collection(db, ...ROSTER_PATH), (snap) => {
+                    const r = [];
+                    snap.forEach(doc => r.push({id: doc.id, ...doc.data()}));
+                    setRoster(r);
+                });
+                
+                const unsubFeed = onSnapshot(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), (snap) => {
+                    const f = [];
+                    snap.forEach(doc => f.push({id: doc.id, ...doc.data()}));
+                    f.sort((a, b) => b.timestamp?.seconds - a.timestamp?.seconds);
+                    setFeed(f);
+                });
+
+                return () => { unsubGame(); unsubPlayers(); unsubQS(); unsubRoster(); unsubFeed(); };
+            }, [db]);
+
+            // Sync Local Questions when Editor opens
+            useEffect(() => {
+                if (showQuestionEditor && gameState?.questions) {
+                    setLocalQuestions(JSON.parse(JSON.stringify(gameState.questions)));
+                }
+            }, [showQuestionEditor, gameState]);
+
+            // Auto-End Voting Logic
+            useEffect(() => {
+                if (gameState?.phase === 'Meeting') {
+                    const alivePlayers = Object.values(players).filter(p => p.isAlive);
+                    const votedCount = alivePlayers.filter(p => p.hasVoted).length;
+                    if (alivePlayers.length > 0 && votedCount === alivePlayers.length) {
+                        endMeeting(); 
+                    }
+                }
+            }, [players, gameState?.phase]);
+
+            const startGame = async () => {
+                const pIds = Object.keys(players);
+                if (pIds.length < 3) return alert("Need 3+ players");
+                
+                const imposters = [...pIds].sort(()=>0.5-Math.random()).slice(0, config.imposterCount);
+                const batch = writeBatch(db);
+                
+                pIds.forEach(pid => {
+                    batch.update(getPlayerRef(db, pid), {
+                        role: imposters.includes(pid) ? 'Imposter' : 'Crewmate',
+                        isAlive: true, energy: 0, investigatedStatus: 'Normal',
+                        votes: 0, correct: 0, incorrect: 0, hasVoted: false, notes: ""
+                    });
+                });
+
+                batch.set(getGameRef(db), {
+                    status: 'Active', phase: 'Game', startTime: serverTimestamp(),
+                    config: { ...config, investigationsLeft: Math.floor(pIds.length * config.invRatio) },
+                    ejectionData: deleteField(), winner: deleteField(),
+                    isLocked: true 
+                }, { merge: true });
+
+                await batch.commit();
+            };
+
+            const handleEject = async (playerId) => {
+                const p = players[playerId];
+                if (!p) return;
+                
+                const batch = writeBatch(db);
+                batch.update(getGameRef(db), { phase: 'Ejecting', ejectionData: { name: p.name, role: p.role } });
+                batch.update(getPlayerRef(db, playerId), { isAlive: false });
+                await batch.commit();
+
+                const remainingPlayers = Object.values(players).filter(pl => pl.isAlive && pl.id !== playerId);
+                const activeImposters = remainingPlayers.filter(pl => pl.role === 'Imposter').length;
+                const totalAlive = remainingPlayers.length;
+                
+                if (activeImposters === 0) {
+                    setTimeout(async () => {
+                        await updateDoc(getGameRef(db), { winner: 'Crewmates', phase: 'GameOver' });
+                    }, 9000); 
+                } 
+                else if (totalAlive <= 2 && activeImposters >= 1) {
+                        setTimeout(async () => {
+                        await updateDoc(getGameRef(db), { winner: 'Imposters', phase: 'GameOver' });
+                    }, 9000);
+                }
+            };
+
+            const resumeGame = async () => {
+                await updateDoc(getGameRef(db), { phase: 'Game', ejectionData: deleteField() });
+            }
+
+            const endMeeting = async () => {
+                let maxVotes = -1;
+                let candidate = null;
+                Object.values(players).forEach(p => {
+                    if (p.votes > maxVotes) { maxVotes = p.votes; candidate = p; }
+                    else if (p.votes === maxVotes) candidate = null; // Tie
+                });
+
+                const batch = writeBatch(db);
+                Object.keys(players).forEach(pid => batch.update(getPlayerRef(db, pid), { votes: 0, hasVoted: false }));
+                await batch.commit();
+
+                if (candidate && maxVotes > 0) handleEject(candidate.id);
+                else updateDoc(getGameRef(db), { phase: 'Game' }); // Tie or skip
+            };
+
+            const confirmReset = async () => {
+                const batch = writeBatch(db);
+                batch.update(getGameRef(db), { status: 'Lobby', phase: 'Lobby', ejectionData: deleteField(), winner: deleteField(), isLocked: false });
+                
+                Object.keys(players).forEach(pid => batch.update(getPlayerRef(db, pid), { 
+                    role:'Pending', isAlive:true, energy:0, correct:0, incorrect:0, votes:0, hasVoted:false, notes: ""
+                }));
+
+                const feedSnapshot = await getDocs(collection(db, ...GAMES_PATH, GAME_ID, 'feed'));
+                feedSnapshot.forEach((doc) => {
+                    batch.delete(doc.ref);
+                });
+
+                await batch.commit();
+                setShowStats(false);
+            };
+
+            const removePlayer = async (id) => {
+                if(confirm("Remove player?")) deleteDoc(getPlayerRef(db, id));
+            };
+
+            const removeAllPlayers = async () => {
+                if (!confirm("WARNING: This will remove ALL players from the game. This cannot be undone. Are you sure?")) return;
+                const batch = writeBatch(db);
+                Object.keys(players).forEach(pid => {
+                    batch.delete(getPlayerRef(db, pid));
+                });
+                await batch.commit();
+            };
+
+            // Roster Actions
+            const addStudent = async () => {
+                if (!newStudentName || !newStudentPass) return;
+                const id = newStudentName.toLowerCase().trim();
+                await setDoc(getRosterRef(db, id), {
+                    name: newStudentName,
+                    password: newStudentPass,
+                    createdAt: serverTimestamp()
+                });
+                setNewStudentName(''); setNewStudentPass('');
+            };
+
+            const removeRosterStudent = async (id) => {
+                if (confirm('Remove student from roster?')) await deleteDoc(getRosterRef(db, id));
+            };
+
+            const updateTeacherPass = async () => {
+                if (!newTeacherPass) return;
+                await updateDoc(getGameRef(db), { teacherPassword: newTeacherPass });
+                alert('Password Updated');
+                setNewTeacherPass('');
+            };
+
+            // Question Editor Logic
+            const updateLocalQuestion = (idx, field, value, ansIdx = null) => {
+                const newQs = [...localQuestions];
+                if (field === 'q') newQs[idx].q = value;
+                if (field === 'correct') newQs[idx].correct = value;
+                if (field === 'a' && ansIdx !== null) newQs[idx].a[ansIdx] = value;
+                setLocalQuestions(newQs);
+            };
+
+            const addLocalQuestion = () => {
+                setLocalQuestions([...localQuestions, { q: "New Question", a: ["Opt 1", "Opt 2", "Opt 3", "Opt 4"], correct: 0 }]);
+            };
+
+            const deleteLocalQuestion = (idx) => {
+                if (confirm("Delete this question?")) {
+                    setLocalQuestions(localQuestions.filter((_, i) => i !== idx));
+                }
+            };
+
+            const saveQuestions = async () => {
+                await updateDoc(getGameRef(db), { questions: localQuestions });
+                setShowQuestionEditor(false);
+            };
+
+            // Library Functions
+            const downloadTemplate = () => {
+                const blob = new Blob([CSV_TEMPLATE], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a'); a.href = url; a.download = 'among_ed_import.csv'; a.click();
+            };
+            const loadQuestionSet = async (set) => {
+                if (confirm(`Load "${set.name}"?`)) {
+                    await updateDoc(getGameRef(db), { questions: set.questions });
+                    setLibraryOpen(false);
+                }
+            };
+            const deleteQuestionSet = async (id) => {
+                if (confirm("Delete?")) await deleteDoc(doc(db, ...QUESTION_SETS_PATH, id));
+            };
+            const handleFileUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file || !newSetName.trim()) return alert("Need File & Name");
+                const reader = new FileReader();
+                reader.onload = async (evt) => {
+                    const rows = parseCSV(evt.target.result);
+                    const newQs = [];
+                    for (let i = 1; i < rows.length; i++) { 
+                        const r = rows[i];
+                        if (r.length < 3) continue;
+                        const qText = r[0];
+                        const ans = [r[1], r[2], r[3], r[4]].filter(a=>a);
+                        let cIdx = parseInt(r[5] || "1") - 1;
+                        if (cIdx < 0 || cIdx >= ans.length) cIdx = 0;
+                        if(qText && ans.length>1) newQs.push({q:qText, a:ans, correct:cIdx});
+                    }
+                    if (newQs.length) {
+                        await addDoc(collection(db, ...QUESTION_SETS_PATH), { name: newSetName, questions: newQs, createdAt: serverTimestamp() });
+                        setImportMode(false); setNewSetName('');
+                    } else alert("No valid questions");
+                };
+                reader.readAsText(file);
+            };
+
+            return (
+                <div className="min-h-screen bg-slate-950 text-white p-6">
+                    <div className="max-w-6xl mx-auto">
+                        <div className="flex flex-col md:flex-row justify-between items-center mb-6 gap-4">
+                            <h1 className="text-3xl font-bold flex gap-2"><Radio/> Mission Control</h1>
+                            
+                            {/* VIEW TABS */}
+                            <div className="flex bg-slate-800 rounded p-1">
+                                <button onClick={() => setView('game')} className={`px-4 py-2 rounded font-bold ${view==='game' ? 'bg-slate-600 text-white' : 'text-slate-400'}`}>Game</button>
+                                <button onClick={() => setView('roster')} className={`px-4 py-2 rounded font-bold ${view==='roster' ? 'bg-slate-600 text-white' : 'text-slate-400'}`}>Roster & Settings</button>
+                            </div>
+
+                            <div className="flex gap-2 items-center">
+                                {/* Music Controls Widget */}
+                                <div className="bg-slate-800 px-3 py-1 rounded-xl flex items-center gap-3 border border-slate-700 mr-2 shadow-lg">
+                                    <button onClick={togglePlay} className={`p-2 rounded-full ${isPlaying ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-cyan-400'}`}>
+                                        {isPlaying ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
+                                    </button>
+                                    
+                                    <div className="flex flex-col">
+                                        <select 
+                                            value={currentTrack.id} 
+                                            onChange={(e) => {
+                                                const track = musicLibrary.find(t => t.id === e.target.value);
+                                                if(track) setCurrentTrack(track);
+                                            }}
+                                            className="bg-transparent text-xs font-bold w-32 outline-none cursor-pointer"
+                                        >
+                                            {musicLibrary.map(t => (
+                                                <option key={t.id} value={t.id} className="bg-slate-900">{t.name}</option>
+                                            ))}
+                                        </select>
+                                        <div className="flex items-center gap-2 mt-1">
+                                            <button onClick={() => setIsLooping(!isLooping)} className={`${isLooping ? 'text-green-400' : 'text-slate-500'} hover:text-white`} title="Loop">
+                                                <Repeat size={12} />
+                                            </button>
+                                            <button onClick={() => setIsShuffling(!isShuffling)} className={`${isShuffling ? 'text-purple-400' : 'text-slate-500'} hover:text-white`} title="Shuffle">
+                                                <Shuffle size={12} />
+                                            </button>
+                                            <div className="h-3 w-[1px] bg-slate-600 mx-1"></div>
+                                            <button onClick={() => setIsMuted(!isMuted)} className="text-slate-400 hover:text-white">
+                                                {isMuted ? <VolumeX size={12} /> : <Volume2 size={12} />}
+                                            </button>
+                                            <input 
+                                                type="range" min="0" max="1" step="0.05" 
+                                                value={isMuted ? 0 : volume} 
+                                                onChange={(e) => {setVolume(parseFloat(e.target.value)); setIsMuted(false);}}
+                                                className="w-12 h-1 bg-slate-600 rounded-lg appearance-none cursor-pointer"
+                                            />
+                                        </div>
+                                    </div>
+
+                                    <button onClick={() => setShowMusicManager(true)} className="p-2 text-slate-400 hover:text-white border-l border-slate-600 pl-3 ml-1">
+                                        <Music size={16} />
+                                    </button>
+                                </div>
+
+                                <button onClick={() => updateDoc(getGameRef(db), { isLocked: !gameState?.isLocked })} className={`px-4 py-2 rounded flex gap-2 items-center ${gameState?.isLocked ? 'bg-red-600' : 'bg-green-600'}`}>
+                                    {gameState?.isLocked ? <LockIcon size={16}/> : <UnlockIcon size={16}/>} {gameState?.isLocked ? 'Locked' : 'Open'}
+                                </button>
+                                <button onClick={() => window.open(`${window.location.pathname}?mode=feed`, '_blank')} className="bg-purple-600 px-4 py-2 rounded flex gap-2 items-center"><ExternalLink size={16}/> Projector</button>
+                            </div>
+                        </div>
+
+                        {view === 'roster' ? (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
+                                    <h2 className="text-xl font-bold text-cyan-400 mb-4 flex items-center gap-2"><UserPlus /> Add to Roster</h2>
+                                    <div className="space-y-3">
+                                        <input value={newStudentName} onChange={(e) => setNewStudentName(e.target.value)} placeholder="Student Name" className="w-full p-2 bg-slate-800 rounded border border-slate-700" />
+                                        <input value={newStudentPass} onChange={(e) => setNewStudentPass(e.target.value)} placeholder="Set Password" className="w-full p-2 bg-slate-800 rounded border border-slate-700" />
+                                        <button onClick={addStudent} className="w-full bg-cyan-600 hover:bg-cyan-500 py-2 rounded font-bold">Add Student</button>
+                                    </div>
+                                    <div className="mt-8 pt-8 border-t border-slate-800">
+                                        <h2 className="text-xl font-bold text-slate-200 mb-4 flex items-center gap-2"><Key /> Teacher Settings</h2>
+                                        <input value={newTeacherPass} onChange={(e) => setNewTeacherPass(e.target.value)} placeholder="New Teacher Password" className="w-full p-2 bg-slate-800 rounded border border-slate-700 mb-2" />
+                                        <button onClick={updateTeacherPass} className="w-full bg-slate-700 hover:bg-slate-600 py-2 rounded font-bold">Update Password</button>
+                                    </div>
+                                </div>
+                                <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
+                                    <h2 className="text-xl font-bold text-slate-200 mb-4">Current Class ({roster.length})</h2>
+                                    <div className="max-h-[500px] overflow-y-auto space-y-2 pr-2">
+                                        {roster.map(s => (
+                                            <div key={s.id} className="flex justify-between items-center bg-slate-800 p-3 rounded border border-slate-700">
+                                                <div><div className="font-bold">{s.name}</div><div className="text-xs text-slate-400">Password: {s.password}</div></div>
+                                                <button onClick={() => removeRosterStudent(s.id)} className="text-red-400 hover:text-red-300 p-2"><Trash2 size={18} /></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                                <div className="lg:col-span-1 space-y-6">
+                                    <div className="bg-slate-900 p-6 rounded-xl border border-slate-800">
+                                        {gameState?.status === 'Lobby' ? (
+                                            <div className="space-y-4">
+                                                <h3 className="font-bold text-cyan-400 border-b border-slate-700 pb-2">Mission Settings</h3>
+                                                <div className="flex justify-between items-center"><span>Imposters:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.imposterCount} onChange={e=>setConfig({...config, imposterCount:parseInt(e.target.value)})} /></div>
+                                                <div className="flex justify-between items-center"><span>Inv. Ratio:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.invRatio} onChange={e=>setConfig({...config, invRatio:parseInt(e.target.value)})} /></div>
+                                                <div className="flex justify-between items-center"><span>Remove Amt:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.removeAmount} onChange={e=>setConfig({...config, removeAmount:parseInt(e.target.value)})} /></div>
+                                                
+                                                <div className="grid grid-cols-2 gap-2 mt-2">
+                                                    <button onClick={() => setShowCostEditor(true)} className="py-2 bg-slate-700 hover:bg-slate-600 rounded font-bold text-xs flex justify-center items-center gap-1">
+                                                        <Sliders size={14} /> Energy Costs
+                                                    </button>
+                                                    <button onClick={() => setShowQuestionEditor(true)} className="py-2 bg-slate-700 hover:bg-slate-600 rounded font-bold text-xs flex justify-center items-center gap-1">
+                                                        <Edit size={14}/> Edit Questions
+                                                    </button>
+                                                </div>
+
+                                                <div className="grid grid-cols-2 gap-2 mt-2">
+                                                    <button onClick={() => { setLibraryOpen(true); setImportMode(false); }} className="py-2 bg-slate-700 hover:bg-slate-600 rounded font-bold flex items-center justify-center gap-2 text-xs">
+                                                        <Library size={16} /> Question Library
+                                                    </button>
+                                                    <button onClick={startGame} className="py-2 bg-green-600 hover:bg-green-500 rounded font-bold text-xs">
+                                                        START MISSION
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-3">
+                                                <div className="p-4 bg-slate-800 rounded border border-cyan-500/30">
+                                                    <div className="text-xs text-slate-400 uppercase">Investigations Left</div>
+                                                    <div className="text-3xl font-mono text-cyan-400">{gameState?.config?.investigationsLeft}</div>
+                                                </div>
+                                                <button onClick={() => setShowStats(true)} className="w-full py-2 bg-orange-700 hover:bg-orange-600 rounded font-bold">Reset to Lobby</button>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="bg-slate-900 p-4 rounded-xl border border-slate-800 h-64 overflow-y-auto">
+                                            <h3 className="text-sm font-bold text-slate-400 uppercase mb-3 sticky top-0 bg-slate-900 pb-2">Public Feed</h3>
+                                            <div className="space-y-2">
+                                            {feed.map(f => (
+                                                <div key={f.id} className="text-sm p-2 bg-slate-800 rounded border-l-2 border-cyan-500 animate-fade-in">
+                                                    <div className="flex justify-between items-center mb-1">
+                                                        <span className="text-cyan-300 font-bold text-xs">{f.source}</span>
+                                                        <span className="text-sm text-slate-500 font-mono">
+                                                            {f.timestamp?.seconds ? new Date(f.timestamp.seconds * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'}) : ''}
+                                                        </span>
+                                                    </div>
+                                                    <span className="text-slate-200">{f.message}</span>
+                                                </div>
+                                            ))}
+                                            {feed.length === 0 && <p className="text-slate-600 italic text-sm">No activity yet...</p>}
+                                            </div>
+                                    </div>
+                                </div>
+
+                                <div className="lg:col-span-2 bg-slate-900 p-6 rounded-xl border border-slate-800">
+                                    <div className="flex justify-between items-center mb-4">
+                                        <h2 className="text-2xl font-bold">Crew Manifest ({Object.keys(players).length})</h2>
+                                        <div className="flex gap-2">
+                                            <button onClick={removeAllPlayers} className="bg-red-950 border border-red-800 text-red-200 px-3 py-2 rounded font-bold text-xs hover:bg-red-900 transition-colors">Remove All Crew</button>
+                                            {gameState?.phase === 'Meeting' && <button onClick={endMeeting} className="bg-red-600 px-4 py-2 rounded font-bold animate-pulse">Force End Vote</button>}
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        {Object.values(players).map(p => (
+                                            <div key={p.id} className={`flex justify-between items-center p-3 rounded border ${p.isAlive?'bg-slate-800 border-slate-700':'bg-red-900/20 border-red-900'}`}>
+                                                <div>
+                                                    <div className="font-bold flex items-center gap-2">
+                                                        {p.isAlive?<Users size={16} className="text-cyan-400"/>:<Skull size={16} className="text-red-500"/>}
+                                                        {p.name}
+                                                        {gameState?.status !== 'Lobby' && <span className={`text-[10px] px-1 rounded ${p.role==='Imposter'?'bg-red-600':'bg-cyan-600'}`}>{p.role}</span>}
+                                                    </div>
+                                                    <div className="text-xs text-slate-400">⚡ {p.energy} | ✓ {p.correct} | Votes: {p.votes || 0}</div>
+                                                </div>
+                                                <button onClick={() => removePlayer(p.id)} className="text-slate-500 hover:text-red-500"><Trash2 size={16}/></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Music Manager Modal */}
+                        {showMusicManager && (
+                            <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+                                <div className="bg-slate-800 w-full max-w-xl rounded-xl p-6 border border-slate-700 max-h-[90vh] flex flex-col">
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h2 className="text-2xl font-bold text-cyan-400 flex items-center gap-2"><Music size={24}/> Music Library</h2>
+                                        <button onClick={() => setShowMusicManager(false)} className="bg-slate-700 px-3 py-1 rounded hover:bg-slate-600">Close</button>
+                                    </div>
+
+                                    <div className="mb-6 bg-slate-900 p-4 rounded border border-slate-700">
+                                        <h3 className="font-bold text-slate-300 mb-2 text-sm uppercase">Add New Track</h3>
+                                        <div className="space-y-3">
+                                            <input value={uploadName} onChange={e=>setUploadName(e.target.value)} placeholder="Track Name" className="w-full p-2 bg-slate-800 rounded border border-slate-600 text-sm" />
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="block text-[10px] text-slate-500 mb-1">UPLOAD FILE (Max 900KB)</label>
+                                                    <input type="file" accept=".mp3,.wav" ref={fileInputRefMusic} onChange={handleMusicUpload} className="block w-full text-xs text-slate-400 file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-cyan-600 file:text-white hover:file:bg-cyan-500"/>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] text-slate-500 mb-1">OR PASTE URL</label>
+                                                    <div className="flex gap-1">
+                                                        <input value={uploadUrl} onChange={e=>setUploadUrl(e.target.value)} placeholder="https://..." className="flex-1 p-1 bg-slate-800 rounded border border-slate-600 text-xs" />
+                                                        <button onClick={handleUrlAdd} className="bg-slate-700 px-2 rounded"><PlusCircle size={14}/></button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex-1 overflow-y-auto space-y-2 pr-2">
+                                        {musicLibrary.map(t => (
+                                            <div key={t.id} className={`flex justify-between items-center p-3 rounded border ${t.id === currentTrack.id ? 'bg-cyan-900/30 border-cyan-500' : 'bg-slate-700 border-slate-600'}`}>
+                                                <div className="flex items-center gap-2 overflow-hidden">
+                                                    <button onClick={() => setCurrentTrack(t)} className="p-2 bg-slate-800 rounded-full hover:bg-slate-600">
+                                                        {t.id === currentTrack.id && isPlaying ? <Pause size={12}/> : <Play size={12}/>}
+                                                    </button>
+                                                    <div className="truncate">
+                                                        <div className="font-bold text-sm truncate">{t.name}</div>
+                                                        <div className="text-[10px] text-slate-400">{t.id === 'default_ambient' ? 'System Default' : 'Custom Track'}</div>
+                                                    </div>
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    {t.isDefault ? (
+                                                        <span className="text-yellow-400" title="Default Track"><Star size={16} fill="currentColor"/></span>
+                                                    ) : (
+                                                        <button onClick={() => setTrackAsDefault(t.id)} className="text-slate-500 hover:text-yellow-400" title="Set as Default"><Star size={16}/></button>
+                                                    )}
+                                                    {t.id !== 'default_ambient' && (
+                                                        <button onClick={() => deleteTrack(t.id)} className="text-slate-500 hover:text-red-400"><Trash2 size={16}/></button>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Question Editor Modal */}
+                        {showQuestionEditor && (
+                            <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+                                <div className="bg-slate-800 w-full max-w-4xl rounded-xl p-6 border border-slate-700 h-[90vh] flex flex-col">
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h2 className="text-2xl font-bold text-cyan-400 flex items-center gap-2"><Edit size={24}/> Edit Mission Questions</h2>
+                                        <div className="flex gap-2">
+                                            <button onClick={addLocalQuestion} className="bg-green-600 px-4 py-2 rounded font-bold flex items-center gap-2 hover:bg-green-500"><PlusCircle size={16}/> Add Question</button>
+                                            <button onClick={saveQuestions} className="bg-cyan-600 px-4 py-2 rounded font-bold flex items-center gap-2 hover:bg-cyan-500"><Save size={16}/> Save Changes</button>
+                                            <button onClick={() => setShowQuestionEditor(false)} className="bg-slate-700 px-4 py-2 rounded font-bold hover:bg-slate-600">Cancel</button>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="flex-1 overflow-y-auto space-y-4 pr-2">
+                                        {localQuestions.map((q, idx) => (
+                                            <div key={idx} className="bg-slate-900 p-4 rounded-lg border border-slate-700 relative group">
+                                                <button onClick={() => deleteLocalQuestion(idx)} className="absolute top-2 right-2 p-2 text-slate-600 hover:text-red-500 transition-colors"><Trash2 size={18}/></button>
+                                                
+                                                <div className="mb-3 pr-10">
+                                                    <label className="text-xs text-slate-500 uppercase font-bold mb-1 block">Question {idx + 1}</label>
+                                                    <input 
+                                                        className="w-full bg-slate-800 border border-slate-600 rounded p-2 text-white" 
+                                                        value={q.q} 
+                                                        onChange={(e) => updateLocalQuestion(idx, 'q', e.target.value)}
+                                                        placeholder="Enter question text..."
+                                                    />
+                                                </div>
+
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                                    {q.a.map((ans, aIdx) => (
+                                                        <div key={aIdx} className="flex items-center gap-2">
+                                                            <input 
+                                                                type="radio" 
+                                                                name={`correct-${idx}`} 
+                                                                checked={q.correct === aIdx} 
+                                                                onChange={() => updateLocalQuestion(idx, 'correct', aIdx)}
+                                                                className="w-4 h-4 accent-green-500 cursor-pointer"
+                                                            />
+                                                            <input 
+                                                                className={`flex-1 bg-slate-800 border rounded p-2 text-sm ${q.correct === aIdx ? 'border-green-500 text-green-400' : 'border-slate-600 text-slate-300'}`}
+                                                                value={ans}
+                                                                onChange={(e) => updateLocalQuestion(idx, 'a', e.target.value, aIdx)}
+                                                                placeholder={`Option ${aIdx + 1}`}
+                                                            />
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {localQuestions.length === 0 && (
+                                            <div className="text-center py-20 text-slate-600 italic">No questions loaded. Click 'Add Question' to start.</div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Cost Config Modal */}
+                        {showCostEditor && (
+                            <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+                                <div className="bg-slate-800 w-full max-w-lg rounded-xl p-6 border border-slate-700 max-h-[90vh] overflow-y-auto">
+                                    <h2 className="text-xl font-bold text-cyan-400 mb-4 flex items-center gap-2"><Sliders size={20}/> Energy Costs Configuration</h2>
+                                    
+                                    <div className="space-y-6">
+                                        <div>
+                                            <h3 className="text-sm font-bold text-green-400 uppercase mb-3 border-b border-green-900 pb-1">Crewmate Actions</h3>
+                                            <div className="grid grid-cols-2 gap-4">
+                                                <div><label className="text-xs text-slate-400">Note Peek</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.peek} onChange={e => setConfig({...config, costs: {...config.costs, peek: parseInt(e.target.value) || 0}})} /></div>
+                                                <div><label className="text-xs text-slate-400">Private Inv.</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.private} onChange={e => setConfig({...config, costs: {...config.costs, private: parseInt(e.target.value) || 0}})} /></div>
+                                                <div><label className="text-xs text-slate-400">Public Inv.</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.public} onChange={e => setConfig({...config, costs: {...config.costs, public: parseInt(e.target.value) || 0}})} /></div>
+                                                <div><label className="text-xs text-slate-400">Emergency</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.emergency} onChange={e => setConfig({...config, costs: {...config.costs, emergency: parseInt(e.target.value) || 0}})} /></div>
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <h3 className="text-sm font-bold text-red-400 uppercase mb-3 border-b border-red-900 pb-1">Imposter Actions</h3>
+                                            <div className="grid grid-cols-2 gap-4">
+                                                <div><label className="text-xs text-slate-400">Remove Inv.</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.remove} onChange={e => setConfig({...config, costs: {...config.costs, remove: parseInt(e.target.value) || 0}})} /></div>
+                                                <div><label className="text-xs text-slate-400">Fake Scan</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.fake} onChange={e => setConfig({...config, costs: {...config.costs, fake: parseInt(e.target.value) || 0}})} /></div>
+                                                <div><label className="text-xs text-slate-400">Make Unclear</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.unclear} onChange={e => setConfig({...config, costs: {...config.costs, unclear: parseInt(e.target.value) || 0}})} /></div>
+                                                <div><label className="text-xs text-slate-400">Disguise Self</label><input type="number" className="w-full bg-slate-900 p-2 rounded border border-slate-700" value={config.costs.disguise} onChange={e => setConfig({...config, costs: {...config.costs, disguise: parseInt(e.target.value) || 0}})} /></div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <button onClick={() => setShowCostEditor(false)} className="w-full mt-6 py-3 bg-slate-600 hover:bg-slate-500 rounded font-bold">Save Configuration</button>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Resume Overlay for Teacher */}
+                        {gameState?.phase === 'Ejecting' && <EjectionSequence data={gameState.ejectionData} isPublic={false} isTeacher={true} onResume={resumeGame} />}
+
+                        {/* Question Library Modal */}
+                        {libraryOpen && (
+                            <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+                                <div className="bg-slate-800 w-full max-w-2xl rounded-xl p-8 border border-slate-700 flex flex-col max-h-[90vh]">
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h2 className="text-2xl font-bold flex items-center gap-2"><Library className="text-cyan-400"/> Question Library</h2>
+                                        <button onClick={() => setLibraryOpen(false)} className="p-2 bg-slate-700 rounded-full"><XCircle /></button>
+                                    </div>
+                                    <div className="flex gap-2 mb-4">
+                                        <button onClick={() => setImportMode(false)} className={`flex-1 py-2 rounded font-bold ${!importMode ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-slate-400'}`}>Saved Sets</button>
+                                        <button onClick={() => setImportMode(true)} className={`flex-1 py-2 rounded font-bold ${importMode ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-slate-400'}`}>Import New</button>
+                                    </div>
+                                    {!importMode && (
+                                        <div className="flex-1 overflow-y-auto space-y-2 pr-2">
+                                            <div className="bg-slate-900 p-3 rounded border border-slate-700 mb-4">
+                                                <div className="text-sm text-slate-400 uppercase">Active Set</div>
+                                                <div className="font-bold text-xl text-cyan-400">{gameState?.questions?.length || DEFAULT_QUESTIONS.length} Questions Loaded</div>
+                                            </div>
+                                            {questionSets.map(qs => (
+                                                <div key={qs.id} className="flex justify-between items-center bg-slate-700 p-4 rounded border border-slate-600">
+                                                    <div><div className="font-bold text-lg">{qs.name}</div><div className="text-sm text-slate-300">{qs.questions.length} Questions</div></div>
+                                                    <div className="flex gap-2">
+                                                        <button onClick={() => loadQuestionSet(qs)} className="px-4 py-2 bg-green-600 hover:bg-green-500 rounded font-bold flex items-center gap-2"><Play size={16} /> LOAD</button>
+                                                        <button onClick={() => deleteQuestionSet(qs.id)} className="p-2 bg-red-600/20 hover:bg-red-600 text-red-400 hover:text-white rounded"><Trash2 size={18} /></button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                    {importMode && (
+                                        <div className="space-y-6">
+                                            <div className="p-4 bg-slate-900 rounded border border-slate-700">
+                                                <h3 className="font-bold text-slate-200 mb-2">1. Get Template</h3>
+                                                <button onClick={downloadTemplate} className="flex items-center gap-2 text-sm bg-slate-700 hover:bg-slate-600 px-3 py-2 rounded text-white"><Download size={14} /> Download CSV</button>
+                                            </div>
+                                            <div className="p-4 bg-slate-900 rounded border border-slate-700">
+                                                <h3 className="font-bold text-slate-200 mb-2">2. Upload</h3>
+                                                <div className="space-y-3">
+                                                    <input type="text" value={newSetName} onChange={(e) => setNewSetName(e.target.value)} placeholder="Set Name" className="w-full p-2 bg-slate-800 rounded border border-slate-600" />
+                                                    <input type="file" accept=".csv" ref={fileInputRef} onChange={handleFileUpload} className="block w-full text-sm text-slate-400" />
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {showStats && (
+                            <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+                                <div className="bg-slate-800 w-full max-w-2xl rounded-xl p-6 max-h-[90vh] flex flex-col">
+                                    <h2 className="text-2xl font-bold mb-4">Mission Report</h2>
+                                    <div className="flex-1 overflow-y-auto space-y-2 mb-6">
+                                        {Object.values(players).map(p => (
+                                            <div key={p.id} className="flex justify-between bg-slate-700 p-3 rounded">
+                                                <span>{p.name}</span>
+                                                <div className="flex gap-4">
+                                                    <span className="text-green-400">Correct: {p.correct}</span>
+                                                    <span className="text-red-400">Wrong: {p.incorrect}</span>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div className="flex gap-4">
+                                        <button onClick={confirmReset} className="flex-1 py-3 bg-red-600 hover:bg-red-500 rounded font-bold">Confirm Reset</button>
+                                        <button onClick={() => setShowStats(false)} className="flex-1 py-3 bg-slate-600 hover:bg-slate-500 rounded font-bold">Cancel</button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        // --- Student Interface ---
+        function StudentInterface({ user, userName, db }) {
+            const pId = userName.toLowerCase().trim();
+            const [gameState, setGameState] = useState(null);
+            const [me, setMe] = useState(null);
+            const [players, setPlayers] = useState({});
+            const [menuOpen, setMenuOpen] = useState(false);
+            const [noteOpen, setNoteOpen] = useState(false);
+            const [notes, setNotes] = useState("");
+            
+            // Question Engine State
+            const [qIndex, setQIndex] = useState(0);
+            const [questionQueue, setQuestionQueue] = useState([]);
+            
+            // Feedback State
+            const [feedback, setFeedback] = useState(null); // { isCorrect: bool, selectedIndex: number, correctOriginalIndex: number }
+
+            const [viewingNote, setViewingNote] = useState(null);
+            const [showIntro, setShowIntro] = useState(false);
+
+            useEffect(() => {
+                const init = async () => {
+                    const ref = getPlayerRef(db, pId);
+                    const s = await getDoc(ref);
+                    if (!s.exists()) await setDoc(ref, { name: userName, role: 'Pending', isAlive: true, energy: 0, notes: '' });
+                    else await updateDoc(ref, { name: userName });
+                };
+                init();
+
+                const unsubG = onSnapshot(getGameRef(db), (s) => {
+                    const data = s.data();
+                    if (data?.status === 'Active' && gameState?.status === 'Lobby') setShowIntro(true);
+                    setGameState(data);
+                });
+                const unsubP = onSnapshot(getPlayerRef(db, pId), (s) => {
+                    setMe(s.data());
+                    if (s.data()?.notes) setNotes(s.data().notes);
+                });
+                const unsubAll = onSnapshot(collection(db, ...GAMES_PATH, GAME_ID, 'players'), (s) => {
+                    const all = {}; s.forEach(d => all[d.id] = {id: d.id, ...d.data()}); setPlayers(all);
+                });
+                return () => { unsubG(); unsubP(); unsubAll(); };
+            }, [gameState?.status]);
+
+            // --- Question Randomization Logic ---
+
+            // 1. Reset Queue if Teacher loads a completely new Question Set
+            useEffect(() => {
+                setQuestionQueue([]);
+                setQIndex(0);
+                setFeedback(null);
+            }, [JSON.stringify(gameState?.questions)]); 
+
+            // 2. Queue Management (Refill with shuffled indices when running low)
+            useEffect(() => {
+                if (!gameState) return;
+                const qs = gameState.questions || DEFAULT_QUESTIONS;
+                
+                // If we have fewer than 2 questions left in the queue, generate a new shuffled batch
+                if (questionQueue.length <= qIndex + 2) {
+                    const indices = Array.from({length: qs.length}, (_, i) => i);
+                    // Fisher-Yates Shuffle for Question Order
+                    for (let i = indices.length - 1; i > 0; i--) {
+                        const j = Math.floor(Math.random() * (i + 1));
+                        [indices[i], indices[j]] = [indices[j], indices[i]];
+                    }
+                    setQuestionQueue(prev => [...prev, ...indices]);
+                }
+            }, [qIndex, questionQueue.length, gameState]);
+
+            // 3. Derive Current Question Data (Random Q + Scrambled Answers)
+            const currentQData = useMemo(() => {
+                if (!gameState) return null;
+                const qs = gameState.questions || DEFAULT_QUESTIONS;
+                
+                // Get the next random index from our queue
+                const rawIndex = questionQueue[qIndex];
+                
+                // If the queue isn't ready yet, return null (triggers loading state)
+                if (rawIndex === undefined) return null;
+                
+                // Safety fallback
+                const safeQ = qs[rawIndex] || qs[0];
+
+                // Scramble Answers (Fisher-Yates)
+                const options = safeQ.a.map((text, idx) => ({ text, originalIndex: idx }));
+                for (let i = options.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [options[i], options[j]] = [options[j], options[i]];
+                }
+
+                return { 
+                    q: safeQ.q, 
+                    shuffledOptions: options, 
+                    rawCorrectIndex: safeQ.correct 
+                };
+            }, [qIndex, gameState?.questions, questionQueue]);
+
+            const handleAns = async (selectedOption) => {
+                if (!currentQData || feedback) return;
+                // Check against the original index we tracked
+                const correct = selectedOption.originalIndex === currentQData.rawCorrectIndex;
+                
+                const batch = writeBatch(db);
+                const pRef = getPlayerRef(db, pId);
+                
+                if (correct) {
+                    batch.update(pRef, { energy: increment(1), correct: increment(1) });
+                } else {
+                    // Prevent dropping below 0
+                    if (me.energy > 0) batch.update(pRef, { energy: increment(-1) });
+                    batch.update(pRef, { incorrect: increment(1) });
+                }
+                await batch.commit();
+
+                // Set feedback state
+                setFeedback({
+                    isCorrect: correct,
+                    selectedOption: selectedOption,
+                    correctOriginalIndex: currentQData.rawCorrectIndex
+                });
+
+                if (correct) {
+                    // Auto-advance correct answers after short delay
+                    setTimeout(() => {
+                        setQIndex(i => i + 1);
+                        setFeedback(null);
+                    }, 1200);
+                }
+            };
+
+            const nextMission = () => {
+                setQIndex(i => i + 1);
+                setFeedback(null);
+            };
+
+            const voteFor = async (targetId) => {
+                if (me.hasVoted || !me.isAlive) return;
+                const batch = writeBatch(db);
+                batch.update(getPlayerRef(db, pId), { hasVoted: true });
+                batch.update(getPlayerRef(db, targetId), { votes: increment(1) });
+                await batch.commit();
+            };
+
+            if (!gameState || !me) return <div className="min-h-screen bg-slate-900 text-white p-10">Syncing...</div>;
+
+            // Win Screens
+            if (gameState.winner) return <WinScreen winner={gameState.winner} players={players} />;
+            if (gameState.phase === 'Ejecting') return <EjectionSequence data={gameState.ejectionData} isPublic={false} isTeacher={false} />;
+            
+            if (gameState.status === 'Lobby') return (
+                <div className="min-h-screen bg-slate-900 text-white flex flex-col items-center justify-center">
+                    <div className="text-6xl mb-4">🚀</div>
+                    <h2 className="text-2xl font-bold">Waiting for Launch...</h2>
+                    <div className="mt-8 flex flex-wrap gap-2 justify-center max-w-md">
+                        {Object.values(players).map(p => <span key={p.id} className="px-3 py-1 bg-slate-800 rounded-full text-xs">{p.name}</span>)}
+                    </div>
+                </div>
+            );
+
+            if (showIntro) return <IntroSequence role={me.role} onClose={() => setShowIntro(false)} />;
+
+            // Voting Screen
+            if (gameState.phase === 'Meeting') return (
+                <div className="min-h-screen bg-slate-900 text-white flex flex-col p-6">
+                    <div className="text-center mb-6">
+                        <AlertTriangle size={48} className="text-red-500 mx-auto mb-2 animate-bounce" />
+                        <h1 className="text-2xl font-bold text-red-500 uppercase">Emergency Meeting</h1>
+                        <p className="text-slate-400">{me.isAlive ? (me.hasVoted ? "Vote Cast. Waiting..." : "Vote for an Imposter") : "You are dead."}</p>
+                    </div>
+                    {me.isAlive && !me.hasVoted && (
+                        <div className="grid grid-cols-2 gap-3">
+                            {Object.values(players).filter(p => p.isAlive && p.id !== pId).map(p => (
+                                <button key={p.id} onClick={() => voteFor(p.id)} className="p-4 bg-slate-800 border border-slate-600 rounded-xl font-bold hover:bg-red-900 hover:border-red-500 transition-all">
+                                    {p.name}
+                                </button>
+                            ))}
+                            <button onClick={() => voteFor('skip')} className="col-span-2 p-3 bg-slate-700 rounded-xl text-slate-300 font-bold">Skip Vote</button>
+                        </div>
+                    )}
+                </div>
+            );
+
+            return (
+                <div className="min-h-screen bg-slate-900 text-white flex flex-col relative overflow-hidden">
+                    <div className="bg-slate-800 p-3 flex justify-between items-center border-b border-slate-700 relative z-20">
+                        <div className="absolute left-1/2 -translate-x-1/2 font-bold text-cyan-400">{me.name}</div>
+                        <div className="w-8"></div> 
+                        <button onClick={() => setNoteOpen(true)} className="bg-slate-700 p-2 rounded relative">
+                            <FileText size={20} />
+                            {me.notes && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
+                        </button>
+                    </div>
+
+                    <div className="flex-1 flex flex-col items-center justify-center p-4 relative z-10">
+                        {/* Visual Feedback Overlay */}
+                        {feedback?.isCorrect && (
+                            <div className="absolute right-0 top-20 z-30 animate-fade-in pointer-events-none">
+                                <div className="bg-green-600 text-white font-black uppercase text-xl py-2 px-6 rounded-l-xl shadow-lg border-2 border-green-400">
+                                    Correct!
+                                </div>
+                            </div>
+                        )}
+
+                        {!me.isAlive && (
+                            <div className="bg-red-900/50 border border-red-500 p-4 rounded-lg mb-6 text-center w-full max-w-md">
+                                <h3 className="font-bold flex items-center justify-center gap-2"><Ghost/> Ghost Mode</h3>
+                                <p className="text-xs text-red-200">Earn energy to donate!</p>
+                            </div>
+                        )}
+
+                        <div className="w-full max-w-md bg-slate-800 p-6 rounded-2xl shadow-2xl border border-slate-700">
+                            {currentQData ? (
+                                <>
+                                    <h3 className="text-xl font-medium mb-6 text-center">{currentQData.q}</h3>
+                                    <div className="grid grid-cols-1 gap-3">
+                                        {currentQData.shuffledOptions.map((opt, i) => {
+                                            // Determine Styling based on feedback
+                                            let btnClass = `p-4 rounded-xl font-bold text-left transition-transform active:scale-95 text-white ${BTN_COLORS[i % BTN_COLORS.length]}`;
+                                            
+                                            if (feedback) {
+                                                const isThisCorrect = opt.originalIndex === feedback.correctOriginalIndex;
+                                                const isThisSelected = opt.text === feedback.selectedOption.text;
+                                                
+                                                if (isThisCorrect) {
+                                                    // Circle correct answer in green
+                                                    btnClass = "p-4 rounded-xl font-bold text-left text-white bg-slate-800 border-4 border-green-500 shadow-[0_0_15px_rgba(34,197,94,0.5)]";
+                                                } else if (isThisSelected && !feedback.isCorrect) {
+                                                    // Circle wrong selected answer in red
+                                                    btnClass = "p-4 rounded-xl font-bold text-left text-white bg-slate-800 border-4 border-red-500 shadow-[0_0_15px_rgba(239,68,68,0.5)]";
+                                                } else {
+                                                    // Dim others
+                                                    btnClass = "p-4 rounded-xl font-bold text-left text-slate-500 bg-slate-900 opacity-50";
+                                                }
+                                            }
+
+                                            return (
+                                                <button disabled={!!feedback} key={i} onClick={() => handleAns(opt)} className={btnClass}>
+                                                    {opt.text}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                    {feedback && !feedback.isCorrect && (
+                                        <button onClick={nextMission} className="w-full mt-6 py-3 bg-cyan-600 hover:bg-cyan-500 rounded-xl font-bold text-white animate-bounce">
+                                            Next Mission ->
+                                        </button>
+                                    )}
+                                </>
+                            ) : (
+                                <div className="text-center py-10 animate-pulse text-slate-400">Loading Mission Data...</div>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="bg-slate-800 p-4 flex justify-between items-center border-t border-slate-700 relative z-20">
+                        <div>
+                            <span className="text-[10px] uppercase text-slate-400 tracking-widest">Energy</span>
+                            <div className="text-3xl font-mono font-bold text-yellow-400 flex items-center gap-1"><Zap fill="currentColor"/> {me.energy}</div>
+                        </div>
+                        <button onClick={() => setMenuOpen(true)} className="bg-slate-700 hover:bg-slate-600 px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg">
+                            <Settings size={20} /> Mission Control
+                        </button>
+                    </div>
+
+                    {/* Modals */}
+                    {menuOpen && <MissionControl role={me.role} energy={me.energy} me={me} pId={pId} players={players} config={gameState.config} db={db} close={() => setMenuOpen(false)} setNote={setViewingNote} />}
+                    
+                    {noteOpen && (
+                        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 z-50">
+                            <div className="bg-slate-800 w-full max-w-lg rounded-xl p-6">
+                                <div className="flex justify-between mb-4"><h2 className="font-bold flex gap-2"><FileText/> Log</h2><button onClick={()=>{updateDoc(getPlayerRef(db, pId), {notes}); setNoteOpen(false)}}><XCircle/></button></div>
+                                <textarea value={notes} onChange={e=>setNotes(e.target.value)} className="w-full h-40 bg-slate-900 rounded p-3 text-white" placeholder="Suspicions..." />
+                            </div>
+                        </div>
+                    )}
+
+                    {viewingNote && (
+                        <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 z-50">
+                            <div className="bg-slate-800 w-full max-w-md rounded-xl p-6 border border-cyan-500">
+                                <h2 className="font-bold mb-4 text-cyan-400">Decrypted Note</h2>
+                                <div className="bg-slate-900 p-4 rounded italic">"{viewingNote}"</div>
+                                <button onClick={() => setViewingNote(null)} className="w-full mt-4 bg-slate-700 py-2 rounded">Close</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // --- Mission Control ---
+        function MissionControl({ role, energy, me, pId, players, config, db, close, setNote }) {
+            const [msg, setMsg] = useState("");
+            const [mode, setMode] = useState(null); 
+            
+            const pay = async (cost) => {
+                if (energy < cost) { setMsg("Insufficient Energy"); return false; }
+                await updateDoc(getPlayerRef(db, pId), { energy: increment(-cost) });
+                return true;
+            };
+
+            // Ghost Logic
+            if (!me.isAlive) {
+                const handleDonate = async (targetRole) => {
+                    const targets = Object.values(players).filter(p => p.role === targetRole && p.isAlive);
+                    if (targets.length === 0) return setMsg("No living teammates found.");
+                    
+                    if (energy < targets.length) return setMsg(`Need at least ${targets.length} energy to split evenly.`);
+                    
+                    const split = Math.floor(energy / targets.length);
+                    const batch = writeBatch(db);
+                    
+                    batch.update(getPlayerRef(db, pId), { energy: 0 });
+                    targets.forEach(t => {
+                        batch.update(getPlayerRef(db, t.id), { energy: increment(split) });
+                    });
+                    
+                    await batch.commit();
+                    close();
+                };
+
+                return (
+                    <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
+                        <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim text-center">
+                            <div className="flex justify-between items-center mb-6">
+                                <h2 className="text-2xl font-black uppercase text-cyan-400">Ghost Uplink</h2>
+                                <button onClick={close}><XCircle /></button>
+                            </div>
+                            {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded">{msg}</div>}
+                            <div className="space-y-4">
+                                <button onClick={() => handleDonate('Crewmate')} className="w-full py-4 bg-cyan-600 hover:bg-cyan-500 rounded-xl font-bold text-lg flex flex-col items-center">
+                                    <span>Donate to Crewmates</span>
+                                    <span className="text-xs font-normal opacity-75">Split all energy evenly</span>
+                                </button>
+                                <button onClick={() => handleDonate('Imposter')} className="w-full py-4 bg-red-600 hover:bg-red-500 rounded-xl font-bold text-lg flex flex-col items-center">
+                                    <span>Donate to Imposters</span>
+                                    <span className="text-xs font-normal opacity-75">Split all energy evenly</span>
+                                </button>
+                            </div>
+                            <div className="mt-4 text-center text-xs text-slate-500">CURRENT ENERGY: {energy}</div>
+                        </div>
+                    </div>
+                );
+            }
+
+            const doPeek = async (targetId) => {
+                if (!await pay(config.costs.peek)) return;
+                const target = players[targetId];
+                setNote(`${target.name}: ${target.notes || "Notes Empty"}`);
+                close();
+            };
+
+            const doInvestigate = async (targetId, isPublic) => {
+                const cost = isPublic ? config.costs.public : config.costs.private;
+                if (config.investigationsLeft <= 0) { setMsg("No Investigations Left"); return; }
+                if (!await pay(cost)) return;
+
+                await updateDoc(getGameRef(db), { 'config.investigationsLeft': increment(-1) });
+                
+                const t = players[targetId];
+                let res = "Inconclusive";
+                const isImp = t.role === 'Imposter';
+
+                if (isImp) {
+                    res = t.investigatedStatus === 'Disguised' ? "All Clear" : "Inconclusive";
+                } else {
+                    // Crewmate Logic
+                    if (t.investigatedStatus === 'Unclear') {
+                        res = "Inconclusive";
+                    } else {
+                        // 33% Chance of Inconclusive for Innocent Crew
+                        res = Math.random() < 0.33 ? "Inconclusive" : "All Clear";
+                    }
+                }
+
+                if (isPublic) await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), { message: `Public Scan on ${t.name}: ${res}`, source: 'System', timestamp: serverTimestamp() });
+                else alert(`SCAN RESULT: ${t.name} is ${res}`);
+                close();
+            };
+
+            const doSabotage = async (type, targetId) => {
+                if (type === 'remove') {
+                    if (!await pay(config.costs.remove)) return;
+                    const snap = await getDoc(getGameRef(db));
+                    const currentLeft = snap.data().config.investigationsLeft;
+                    const newInv = Math.max(0, currentLeft - config.removeAmount);
+                    
+                    await updateDoc(getGameRef(db), { 'config.investigationsLeft': newInv });
+                    if (newInv === 0) await updateDoc(getGameRef(db), { winner: 'Imposters' });
+                } else if (type === 'fake') {
+                    if (!await pay(config.costs.fake)) return;
+                    const rand = Object.values(players)[Math.floor(Math.random()*Object.values(players).length)];
+                    await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), { message: `Public Scan on ${rand.name}: All Clear`, source: 'System', timestamp: serverTimestamp() });
+                } else if (type === 'unclear') {
+                    if (!await pay(config.costs.unclear)) return;
+                    await updateDoc(getPlayerRef(db, targetId), { investigatedStatus: 'Unclear' });
+                } else if (type === 'disguise') {
+                    if (!await pay(config.costs.disguise)) return;
+                    await updateDoc(getPlayerRef(db, pId), { investigatedStatus: 'Disguised' });
+                }
+                close();
+            };
+
+            if (mode) {
+                return (
+                    <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-6">
+                        <div className="bg-slate-800 w-full max-w-md rounded-xl p-4">
+                            <h3 className="font-bold mb-4">Select Target</h3>
+                            <div className="grid grid-cols-2 gap-2 max-h-64 overflow-y-auto">
+                                {Object.values(players).filter(p => p.id !== pId && p.isAlive).map(p => (
+                                    <button key={p.id} onClick={() => {
+                                        if (mode === 'peek') doPeek(p.id);
+                                        if (mode === 'private') doInvestigate(p.id, false);
+                                        if (mode === 'public') doInvestigate(p.id, true);
+                                        if (mode === 'unclear') doSabotage('unclear', p.id);
+                                    }} className="p-3 bg-slate-700 rounded font-bold hover:bg-cyan-600 text-white">{p.name}</button>
+                                ))}
+                            </div>
+                            <button onClick={() => setMode(null)} className="w-full mt-4 py-2 bg-slate-900 text-slate-400 rounded">Cancel</button>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
+                    <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim">
+                        <div className="flex justify-between items-center mb-6">
+                            <h2 className="text-2xl font-black uppercase text-cyan-400">Mission Control</h2>
+                            <button onClick={close}><XCircle /></button>
+                        </div>
+                        {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded">{msg}</div>}
+                        
+                        <div className="grid grid-cols-2 gap-3">
+                            {role === 'Crewmate' ? (
+                                <>
+                                    <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
+                                    <ActionBtn icon={Lock} title="Private Inv." desc="Investigate a player privately." cost={config.costs.private} fullDesc="Check if a player is Crewmate or Imposter. Only you see the result." onClick={() => setMode('private')} />
+                                    <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & tell everyone." cost={config.costs.public} fullDesc="Check a player and broadcast the result to the Teacher's screen." onClick={() => setMode('public')} />
+                                    <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={async () => { if(!config.meetingsEnabled) return setMsg("Disabled"); if(await pay(config.costs.emergency)) { await updateDoc(getGameRef(db), {phase:'Meeting'}); close(); } }} color="red" />
+                                </>
+                            ) : (
+                                <>
+                                    <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool. If it hits 0, Imposters win.`} onClick={() => doSabotage('remove')} />
+                                    <ActionBtn icon={FileText} title="Fake Inv." desc="Pretend to investigate!" cost={config.costs.fake} fullDesc="Generates a fake 'All Clear' report on the public feed to make you look innocent." onClick={() => doSabotage('fake')} />
+                                    <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear' when investigated." onClick={() => setMode('unclear')} />
+                                    <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={() => doSabotage('disguise')} />
+                                </>
+                            )}
+                        </div>
+                        <div className="mt-4 text-center text-xs text-slate-500">CURRENT ENERGY: {energy}</div>
+                    </div>
+                </div>
+            );
+        }
+
+        function ActionBtn({ icon: Icon, title, desc, fullDesc, cost, onClick, color = 'cyan' }) {
+            const [showHelp, setShowHelp] = useState(false);
+            if (showHelp) return (
+                <div onClick={() => setShowHelp(false)} className="col-span-1 p-4 rounded-lg border bg-slate-800 cursor-pointer border-slate-600 flex flex-col items-center text-center justify-center min-h-[120px]">
+                    <p className="text-sm text-slate-300">{fullDesc}</p>
+                    <p className="text-[10px] text-slate-500 mt-2">(Click to return)</p>
+                </div>
+            );
+            return (
+                <div className="relative p-3 rounded-lg border border-cyan-900/50 hover:bg-cyan-900/20 flex flex-col items-center text-center transition-all group bg-slate-800/50">
+                    <button onClick={(e) => { e.stopPropagation(); setShowHelp(true); }} className="absolute top-1 right-1 text-slate-600 hover:text-white"><HelpCircle size={14}/></button>
+                    <div onClick={onClick} className="cursor-pointer w-full flex flex-col items-center">
+                        <Icon className={`w-8 h-8 mb-1 text-cyan-400`} />
+                        <span className="font-bold text-white text-sm">{title}</span>
+                        <span className="text-[10px] text-slate-400 leading-tight my-1">{desc}</span>
+                        <span className="text-xs text-yellow-500 font-mono font-bold">{cost} Energy</span>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
