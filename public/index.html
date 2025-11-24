@@ -84,7 +84,7 @@
             UserPlus, Trash2, Key, Upload, Download, FileDown, Library, Play, Pause,
             Save, HelpCircle, ExternalLink, Lock as LockIcon, Unlock as UnlockIcon,
             MousePointerClick, Sliders, Edit, PlusCircle, Volume2, VolumeX,
-            Repeat, Shuffle, Music, Star, UploadCloud
+            Repeat, Shuffle, Music, Star, UploadCloud, Timer
         } from 'lucide-react';
 
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
@@ -456,7 +456,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const [gameState, setGameState] = useState(null);
             const [players, setPlayers] = useState({});
             const [config, setConfig] = useState({ 
-                imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, costs: DEFAULT_COSTS 
+                imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, meetingCooldown: 120, costs: DEFAULT_COSTS 
             });
             const [showStats, setShowStats] = useState(false);
             const [view, setView] = useState('game'); 
@@ -500,13 +500,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 audioRef.current = new Audio();
                 audioRef.current.volume = volume;
                 
-                // Initialize with default or saved default
-                const initAudio = async () => {
-                    // Try to find default in library
-                    // This will be handled in the library snapshot listener to be safe
-                }
-                
-                // Event Listener for End of Track
                 audioRef.current.addEventListener('ended', handleTrackEnd);
 
                 return () => {
@@ -527,7 +520,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             useEffect(() => {
                 if(!audioRef.current) return;
                 
-                // If source changed
                 const currentSrc = audioRef.current.src;
                 if(currentTrack.url && currentSrc !== currentTrack.url) {
                     audioRef.current.src = currentTrack.url;
@@ -537,7 +529,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                         if(playPromise) playPromise.catch(e => console.log("Play interrupted or waiting interact", e));
                     }
                 } else {
-                    // Just toggle play/pause
                     if (isPlaying) {
                         const playPromise = audioRef.current.play();
                         if(playPromise) playPromise.catch(e => console.log("Play interrupted", e));
@@ -545,7 +536,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                         audioRef.current.pause();
                     }
                 }
-                // Loop handling: We handle looping manually in handleTrackEnd for better control vs shuffle
             }, [currentTrack, isPlaying]);
 
             const handleTrackEnd = () => {
@@ -553,11 +543,10 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     audioRef.current.currentTime = 0;
                     audioRef.current.play();
                 } else if (isShuffling) {
-                    // Pick random track
                     const randomIdx = Math.floor(Math.random() * musicLibrary.length);
                     setCurrentTrack(musicLibrary[randomIdx]);
                 } else {
-                    setIsPlaying(false); // Stop if no loop and no shuffle
+                    setIsPlaying(false);
                 }
             };
 
@@ -566,7 +555,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             // Music Library Persistence
             useEffect(() => {
                 const unsubMusic = onSnapshot(collection(db, ...MUSIC_PATH), (snap) => {
-                    const tracks = [DEFAULT_TRACK]; // Always include default
+                    const tracks = [DEFAULT_TRACK]; 
                     let defaultToPlay = DEFAULT_TRACK;
                     
                     snap.forEach(doc => {
@@ -577,7 +566,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     
                     setMusicLibrary(tracks);
                     
-                    // On first load, if we aren't playing, load the default
                     if(!audioRef.current.src && defaultToPlay) {
                         setCurrentTrack(defaultToPlay);
                     }
@@ -588,7 +576,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const handleMusicUpload = async (e) => {
                 const file = e.target.files[0];
                 if (!file || !uploadName) return alert("Name and File required");
-                
                 if (file.size > 900000) return alert("File too large for this database (Limit: 900KB). Please use a URL for longer tracks.");
 
                 const reader = new FileReader();
@@ -626,16 +613,12 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             };
 
             const setTrackAsDefault = async (targetId) => {
-                // First, unset all
-                // Note: This is a bit heavy for Firestore reads/writes but fine for small libraries
                 const batch = writeBatch(db);
-                
                 musicLibrary.forEach(t => {
                     if (t.id !== 'default_ambient') {
                         batch.update(doc(db, ...MUSIC_PATH, t.id), { isDefault: t.id === targetId });
                     }
                 });
-                
                 await batch.commit();
                 alert("New default set. Refresh to apply on startup.");
             };
@@ -650,7 +633,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     } else {
                         setDoc(getGameRef(db), {
                             status: 'Lobby', phase: 'Lobby',
-                            config: { imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, costs: DEFAULT_COSTS },
+                            config: { imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, meetingCooldown: 120, costs: DEFAULT_COSTS },
                             teacherPassword: 'admin', questions: DEFAULT_QUESTIONS, isLocked: false
                         });
                     }
@@ -717,8 +700,16 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     status: 'Active', phase: 'Game', startTime: serverTimestamp(),
                     config: { ...config, investigationsLeft: Math.floor(pIds.length * config.invRatio) },
                     ejectionData: deleteField(), winner: deleteField(),
-                    isLocked: true 
+                    isLocked: true, lastMeetingEnded: deleteField() 
                 }, { merge: true });
+
+                // Start Game Feed Message
+                const feedRef = collection(db, ...GAMES_PATH, GAME_ID, 'feed');
+                batch.set(doc(feedRef), {
+                    message: "🚀 MISSION STARTED! Good luck crew.",
+                    source: "System",
+                    timestamp: serverTimestamp()
+                });
 
                 await batch.commit();
             };
@@ -730,20 +721,42 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 const batch = writeBatch(db);
                 batch.update(getGameRef(db), { phase: 'Ejecting', ejectionData: { name: p.name, role: p.role } });
                 batch.update(getPlayerRef(db, playerId), { isAlive: false });
+                
+                // Voting Result Feed Message
+                const feedRef = collection(db, ...GAMES_PATH, GAME_ID, 'feed');
+                batch.set(doc(feedRef), {
+                    message: `${p.name} was voted out. They were a ${p.role}.`,
+                    source: "System",
+                    timestamp: serverTimestamp()
+                });
+
                 await batch.commit();
 
                 const remainingPlayers = Object.values(players).filter(pl => pl.isAlive && pl.id !== playerId);
                 const activeImposters = remainingPlayers.filter(pl => pl.role === 'Imposter').length;
                 const totalAlive = remainingPlayers.length;
                 
+                // Game Over Checks
                 if (activeImposters === 0) {
                     setTimeout(async () => {
                         await updateDoc(getGameRef(db), { winner: 'Crewmates', phase: 'GameOver' });
+                         await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), {
+                            message: "GAME OVER: Crewmates Win! All Imposters eliminated.",
+                            source: "System",
+                            timestamp: serverTimestamp()
+                        });
                     }, 9000); 
                 } 
                 else if (totalAlive <= 2 && activeImposters >= 1) {
                         setTimeout(async () => {
                         await updateDoc(getGameRef(db), { winner: 'Imposters', phase: 'GameOver' });
+                        // Get Imposter Names for feed
+                        const imps = Object.values(players).filter(pl => pl.role === 'Imposter').map(i => i.name).join(', ');
+                        await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), {
+                            message: `GAME OVER: Imposters Win! The Imposters were: ${imps}`,
+                            source: "System",
+                            timestamp: serverTimestamp()
+                        });
                     }, 9000);
                 }
             };
@@ -762,15 +775,26 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
 
                 const batch = writeBatch(db);
                 Object.keys(players).forEach(pid => batch.update(getPlayerRef(db, pid), { votes: 0, hasVoted: false }));
+                
+                // Record time meeting ended for cooldown logic
+                batch.update(getGameRef(db), { lastMeetingEnded: serverTimestamp() });
+                
                 await batch.commit();
 
                 if (candidate && maxVotes > 0) handleEject(candidate.id);
-                else updateDoc(getGameRef(db), { phase: 'Game' }); // Tie or skip
+                else {
+                     updateDoc(getGameRef(db), { phase: 'Game' }); // Tie or skip
+                     addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), {
+                        message: "Vote result: Tie or Skip. No one was ejected.",
+                        source: "System",
+                        timestamp: serverTimestamp()
+                    });
+                }
             };
 
             const confirmReset = async () => {
                 const batch = writeBatch(db);
-                batch.update(getGameRef(db), { status: 'Lobby', phase: 'Lobby', ejectionData: deleteField(), winner: deleteField(), isLocked: false });
+                batch.update(getGameRef(db), { status: 'Lobby', phase: 'Lobby', ejectionData: deleteField(), winner: deleteField(), isLocked: false, lastMeetingEnded: deleteField() });
                 
                 Object.keys(players).forEach(pid => batch.update(getPlayerRef(db, pid), { 
                     role:'Pending', isAlive:true, energy:0, correct:0, incorrect:0, votes:0, hasVoted:false, notes: ""
@@ -985,6 +1009,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                                 <div className="flex justify-between items-center"><span>Imposters:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.imposterCount} onChange={e=>setConfig({...config, imposterCount:parseInt(e.target.value)})} /></div>
                                                 <div className="flex justify-between items-center"><span>Inv. Ratio:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.invRatio} onChange={e=>setConfig({...config, invRatio:parseInt(e.target.value)})} /></div>
                                                 <div className="flex justify-between items-center"><span>Remove Amt:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.removeAmount} onChange={e=>setConfig({...config, removeAmount:parseInt(e.target.value)})} /></div>
+                                                <div className="flex justify-between items-center"><span>Meeting CD (s):</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.meetingCooldown} onChange={e=>setConfig({...config, meetingCooldown:parseInt(e.target.value)})} /></div>
                                                 
                                                 <div className="grid grid-cols-2 gap-2 mt-2">
                                                     <button onClick={() => setShowCostEditor(true)} className="py-2 bg-slate-700 hover:bg-slate-600 rounded font-bold text-xs flex justify-center items-center gap-1">
@@ -1322,6 +1347,12 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     setGameState(data);
                 });
                 const unsubP = onSnapshot(getPlayerRef(db, pId), (s) => {
+                    // CHANGE 1: FORCE RELOAD IF REMOVED
+                    if (!s.exists()) {
+                        alert("You have been removed from the mission.");
+                        window.location.reload();
+                        return;
+                    }
                     setMe(s.data());
                     if (s.data()?.notes) setNotes(s.data().notes);
                 });
@@ -1553,7 +1584,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     </div>
 
                     {/* Modals */}
-                    {menuOpen && <MissionControl role={me.role} energy={me.energy} me={me} pId={pId} players={players} config={gameState.config} db={db} close={() => setMenuOpen(false)} setNote={setViewingNote} />}
+                    {menuOpen && <MissionControl role={me.role} energy={me.energy} me={me} pId={pId} players={players} config={gameState.config} gameState={gameState} db={db} close={() => setMenuOpen(false)} setNote={setViewingNote} />}
                     
                     {noteOpen && (
                         <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 z-50">
@@ -1578,7 +1609,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
         }
 
         // --- Mission Control ---
-        function MissionControl({ role, energy, me, pId, players, config, db, close, setNote }) {
+        function MissionControl({ role, energy, me, pId, players, config, gameState, db, close, setNote }) {
             const [msg, setMsg] = useState("");
             const [mode, setMode] = useState(null); 
             
@@ -1662,7 +1693,10 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     }
                 }
 
-                if (isPublic) await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), { message: `Public Scan on ${t.name}: ${res}`, source: 'System', timestamp: serverTimestamp() });
+                if (isPublic) {
+                    // CHANGE 3B: Detailed Investigator Feed
+                    await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), { message: `${me.name} investigated ${t.name}: ${res}`, source: 'System', timestamp: serverTimestamp() });
+                }
                 else alert(`SCAN RESULT: ${t.name} is ${res}`);
                 close();
             };
@@ -1675,11 +1709,20 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     const newInv = Math.max(0, currentLeft - config.removeAmount);
                     
                     await updateDoc(getGameRef(db), { 'config.investigationsLeft': newInv });
-                    if (newInv === 0) await updateDoc(getGameRef(db), { winner: 'Imposters' });
+                    if (newInv === 0) {
+                        await updateDoc(getGameRef(db), { winner: 'Imposters' });
+                         // Change 3C: Game End Feed
+                        const imps = Object.values(players).filter(pl => pl.role === 'Imposter').map(i => i.name).join(', ');
+                        await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), {
+                            message: `GAME OVER: Imposters Win by sabotage! The Imposters were: ${imps}`,
+                            source: "System",
+                            timestamp: serverTimestamp()
+                        });
+                    }
                 } else if (type === 'fake') {
                     if (!await pay(config.costs.fake)) return;
                     const rand = Object.values(players)[Math.floor(Math.random()*Object.values(players).length)];
-                    await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), { message: `Public Scan on ${rand.name}: All Clear`, source: 'System', timestamp: serverTimestamp() });
+                    await addDoc(collection(db, ...GAMES_PATH, GAME_ID, 'feed'), { message: `${me.name} investigated ${rand.name}: All Clear`, source: 'System', timestamp: serverTimestamp() });
                 } else if (type === 'unclear') {
                     if (!await pay(config.costs.unclear)) return;
                     await updateDoc(getPlayerRef(db, targetId), { investigatedStatus: 'Unclear' });
@@ -1689,6 +1732,26 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 }
                 close();
             };
+
+            const triggerMeeting = async () => {
+                if(!config.meetingsEnabled) return setMsg("Disabled");
+                
+                // CHANGE 2: Cooldown Logic
+                if (gameState.lastMeetingEnded) {
+                    const now = Date.now();
+                    const lastEnd = gameState.lastMeetingEnded.seconds * 1000;
+                    const diff = (now - lastEnd) / 1000;
+                    const cd = config.meetingCooldown || 120;
+                    if (diff < cd) {
+                        return setMsg(`Cooldown Active: Wait ${Math.ceil(cd - diff)}s`);
+                    }
+                }
+
+                if(await pay(config.costs.emergency)) { 
+                    await updateDoc(getGameRef(db), {phase:'Meeting'}); 
+                    close(); 
+                }
+            }
 
             if (mode) {
                 return (
@@ -1726,7 +1789,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                     <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
                                     <ActionBtn icon={Lock} title="Private Inv." desc="Investigate a player privately." cost={config.costs.private} fullDesc="Check if a player is Crewmate or Imposter. Only you see the result." onClick={() => setMode('private')} />
                                     <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & tell everyone." cost={config.costs.public} fullDesc="Check a player and broadcast the result to the Teacher's screen." onClick={() => setMode('public')} />
-                                    <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={async () => { if(!config.meetingsEnabled) return setMsg("Disabled"); if(await pay(config.costs.emergency)) { await updateDoc(getGameRef(db), {phase:'Meeting'}); close(); } }} color="red" />
+                                    <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={triggerMeeting} color="red" />
                                 </>
                             ) : (
                                 <>
