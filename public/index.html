@@ -1399,14 +1399,35 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             // Paths specific to the selected class
             const paths = useMemo(() => getPaths(classId), [classId]);
 
-            useEffect(() => {
-                const init = async () => {
-                    const ref = getPlayerRef(db, paths, pId);
-                    const s = await getDoc(ref);
-                    if (!s.exists()) await setDoc(ref, { name: userName, role: 'Pending', isAlive: true, energy: 0, notes: '' });
-                    else await updateDoc(ref, { name: userName });
-                };
-                init();
+useEffect(() => {
+    const init = async () => {
+        const ref = getPlayerRef(db, paths, pId);
+        const s = await getDoc(ref);
+        
+        // FIX #2: Check Game Status for Late Joiners
+        let initialRole = 'Pending';
+        if (!s.exists()) {
+            // Fetch game state once to check if active
+            const gameSnap = await getDoc(getGameRef(db, paths));
+            if (gameSnap.exists() && gameSnap.data().status === 'Active') {
+                initialRole = 'Crewmate';
+            }
+            
+            await setDoc(ref, { 
+                name: userName, 
+                role: initialRole, // Used to be hardcoded 'Pending'
+                isAlive: true, 
+                energy: 0, 
+                notes: '',
+                investigatedStatus: 'Normal'
+            });
+        } else {
+            // Just update name if re-joining
+            await updateDoc(ref, { name: userName });
+        }
+    };
+    init();
+
 
                 const unsubG = onSnapshot(getGameRef(db, paths), (s) => {
                     const data = s.data();
@@ -1673,198 +1694,259 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
 
         // --- Mission Control ---
 function MissionControl({ role, energy, me, pId, players, config, gameState, db, classId, close, setNote }) {
-            const [msg, setMsg] = useState("");
-            const [mode, setMode] = useState(null); // 'peek', 'private', 'public', etc.
+    const [msg, setMsg] = useState("");
+    const [mode, setMode] = useState(null); 
+    
+    // Generate paths
+    const paths = useMemo(() => getPaths(classId), [classId]);
+
+    // Helper: Deduct energy
+    const pay = async (amount) => {
+        if (me.energy < amount) {
+            setMsg("Not enough energy!");
+            setTimeout(() => setMsg(""), 2000);
+            return false;
+        }
+        const pRef = getPlayerRef(db, paths, pId);
+        await updateDoc(pRef, { energy: increment(-amount) });
+        return true;
+    };
+
+    // --- FIX #4: NEW INVESTIGATION LOGIC ---
+    const getInvestigationResult = (target) => {
+        const isDisguised = target.investigatedStatus === 'Disguised';
+        const isSabotaged = target.investigatedStatus === 'Unclear';
+        const isImposter = target.role === 'Imposter';
+        const rng = Math.random(); // 0.0 to 1.0
+
+        // 1. Disguise overrides everything (Imposter looks innocent)
+        if (isDisguised) return "All Clear";
+
+        // 2. Sabotage overrides remaining logic (Crew looks suspicious)
+        if (isSabotaged) return "Inconclusive";
+
+        // 3. 33% Global Chance of "Inconclusive" for anyone
+        if (rng < 0.33) return "Inconclusive";
+
+        // 4. Role based results
+        if (isImposter) return "Inconclusive";
+        
+        // 5. Default Crewmate
+        return "All Clear";
+    };
+
+    // --- ACTION HANDLER ---
+    const handleTargetAction = async (targetId) => {
+        const target = players[targetId];
+        if (!target) return;
+
+        if (mode === 'peek') {
+            if (!(await pay(config.costs.peek))) return;
+            setNote(target.notes || "This notebook is empty.");
+            close();
+        }
+        else if (mode === 'private') {
+            if (!(await pay(config.costs.private))) return;
             
-            // Generate paths
-            const paths = useMemo(() => getPaths(classId), [classId]);
+            // Logic: New RNG system
+            const result = getInvestigationResult(target);
 
-            // Helper: Deduct energy
-            const pay = async (amount) => {
-                if (me.energy < amount) {
-                    setMsg("Not enough energy!");
-                    setTimeout(() => setMsg(""), 2000);
-                    return false;
-                }
-                const pRef = getPlayerRef(db, paths, pId);
-                await updateDoc(pRef, { energy: increment(-amount) });
-                return true;
-            };
+            // Reset target status after check
+            if (target.investigatedStatus !== 'Normal') {
+                await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
+            }
 
-            // CREWMATE ACTIONS
-            const handleTargetAction = async (targetId) => {
-                const target = players[targetId];
-                if (!target) return;
+            alert(`INVESTIGATION RESULT:\n\nSubject: ${target.name}\nResult: ${result}`);
+            close();
+        }
+        else if (mode === 'public') {
+            if (!(await pay(config.costs.public))) return;
 
-                if (mode === 'peek') {
-                    if (!(await pay(config.costs.peek))) return;
-                    setNote(target.notes || "This notebook is empty.");
-                    close();
-                }
-                else if (mode === 'private') {
-                    if (!(await pay(config.costs.private))) return;
-                    
-                    // Logic: Check if they are disguised or unclear
-                    let result = target.role;
-                    if (target.investigatedStatus === 'Disguised') result = 'Crewmate'; // False negative
-                    if (target.investigatedStatus === 'Unclear') result = 'Inconclusive';
+            const result = getInvestigationResult(target);
 
-                    // Reset target status after check
-                    if (target.investigatedStatus !== 'Normal') {
-                        await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
-                    }
+            if (target.investigatedStatus !== 'Normal') {
+                await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
+            }
 
-                    alert(`INVESTIGATION RESULT:\n\n${target.name} is: ${result}`);
-                    close();
-                }
-                else if (mode === 'public') {
-                    if (!(await pay(config.costs.public))) return;
+            // Post to feed
+            await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                message: `${me.name} investigated ${target.name}. Result: ${result}`,
+                source: "Investigation Terminal",
+                timestamp: serverTimestamp()
+            });
+            
+            await updateDoc(getGameRef(db, paths), { 
+                'config.investigationsLeft': increment(-1) 
+            });
 
-                    let result = target.role;
-                    if (target.investigatedStatus === 'Disguised') result = 'Crewmate';
-                    if (target.investigatedStatus === 'Unclear') result = 'Inconclusive';
+            close();
+        }
+        else if (mode === 'unclear') {
+             if (!(await pay(config.costs.unclear))) return;
+             await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Unclear' });
+             setMsg(`Sabotaged ${target.name}'s ID!`);
+             setTimeout(close, 1000);
+        }
+        // --- FIX #3: FAKE INVESTIGATION LOGIC ---
+        else if (mode === 'fake') {
+            if (!(await pay(config.costs.fake))) return;
+            
+            await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                message: `${me.name} investigated ${target.name}. Result: All Clear`, // Always fake clear
+                source: "Investigation Terminal",
+                timestamp: serverTimestamp()
+            });
+            
+            setMsg("Fake log generated.");
+            setTimeout(close, 1000);
+        }
+    };
 
-                    if (target.investigatedStatus !== 'Normal') {
-                        await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
-                    }
+    const triggerMeeting = async () => {
+        // Cooldown check
+        const now = new Date().getTime() / 1000;
+        const lastEnd = gameState.lastMeetingEnded ? gameState.lastMeetingEnded.seconds : 0;
+        const cooldown = config.meetingCooldown || 120;
+        
+        if (now - lastEnd < cooldown) {
+            setMsg(`Systems cooling down... Wait ${Math.ceil(cooldown - (now - lastEnd))}s`);
+            setTimeout(() => setMsg(""), 3000);
+            return;
+        }
 
-                    // Post to feed
-                    await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                        message: `${me.name} investigated ${target.name}. Result: ${result}`,
-                        source: "Investigation Terminal",
-                        timestamp: serverTimestamp()
-                    });
-                    
-                    // Decrement global investigations left
-                    await updateDoc(getGameRef(db, paths), { 
-                        'config.investigationsLeft': increment(-1) 
-                    });
+        if (!(await pay(config.costs.emergency))) return;
 
-                    close();
-                }
-                else if (mode === 'unclear') {
-                     if (!(await pay(config.costs.unclear))) return;
-                     await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Unclear' });
-                     setMsg(`Sabotaged ${target.name}'s ID!`);
-                     setTimeout(close, 1000);
-                }
-            };
+        const batch = writeBatch(db);
+        batch.update(getGameRef(db, paths), { phase: 'Meeting' });
+        batch.set(doc(collection(db, ...paths.games, GAME_ID, 'feed')), {
+            message: `🚨 EMERGENCY MEETING CALLED BY ${me.name.toUpperCase()}!`,
+            source: "System Alert",
+            timestamp: serverTimestamp()
+        });
+        await batch.commit();
+        close();
+    };
 
-            const triggerMeeting = async () => {
-                // Check cooldown
-                const now = new Date().getTime() / 1000;
-                const lastEnd = gameState.lastMeetingEnded ? gameState.lastMeetingEnded.seconds : 0;
-                const cooldown = config.meetingCooldown || 120;
+    // --- FIX #1: GHOST ACTIONS ---
+    const donateEnergy = async (targetRole) => {
+        // Transfer all current energy (or fixed amount) to a random alive player of that role
+        if (me.energy < 1) {
+            setMsg("Need energy to donate!"); 
+            return;
+        }
+
+        const potentialTargets = Object.values(players).filter(p => 
+            p.isAlive && p.role === targetRole && p.id !== pId
+        );
+
+        if (potentialTargets.length === 0) {
+            setMsg("No alive teammates found!");
+            return;
+        }
+
+        const recipient = potentialTargets[Math.floor(Math.random() * potentialTargets.length)];
+        const amount = me.energy; // Donate ALL energy
+
+        const batch = writeBatch(db);
+        batch.update(getPlayerRef(db, paths, pId), { energy: 0 }); // Drain Ghost
+        batch.update(getPlayerRef(db, paths, recipient.id), { energy: increment(amount) }); // Give to teammate
+        
+        await batch.commit();
+        setMsg(`Donated ${amount}⚡ to ${recipient.name}`);
+        setTimeout(close, 1500);
+    };
+
+    // IMPOSTER ACTIONS (Instant)
+    const doRemove = async () => {
+        if (!(await pay(config.costs.remove))) return;
+        await updateDoc(getGameRef(db, paths), { 'config.investigationsLeft': increment(-config.removeAmount) });
+        setMsg("Records deleted...");
+        setTimeout(close, 1000);
+    };
+
+    const doDisguise = async () => {
+        if (!(await pay(config.costs.disguise))) return;
+        await updateDoc(getPlayerRef(db, paths, pId), { investigatedStatus: 'Disguised' });
+        setMsg("Disguise active (1 Use)");
+        setTimeout(close, 1000);
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
+            <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim max-h-[90vh] flex flex-col">
+                <div className="flex justify-between items-center mb-6">
+                    <h2 className="text-2xl font-black uppercase text-cyan-400">
+                        {mode ? <button onClick={() => setMode(null)} className="text-sm mr-2 text-slate-400 hover:text-white">← BACK</button> : null}
+                        Mission Control
+                    </h2>
+                    <button onClick={close}><XCircle /></button>
+                </div>
                 
-                if (now - lastEnd < cooldown) {
-                    setMsg(`Systems cooling down... Wait ${Math.ceil(cooldown - (now - lastEnd))}s`);
-                    setTimeout(() => setMsg(""), 3000);
-                    return;
-                }
-
-                if (!(await pay(config.costs.emergency))) return;
-
-                const batch = writeBatch(db);
-                batch.update(getGameRef(db, paths), { phase: 'Meeting' });
-                batch.set(doc(collection(db, ...paths.games, GAME_ID, 'feed')), {
-                    message: `🚨 EMERGENCY MEETING CALLED BY ${me.name.toUpperCase()}!`,
-                    source: "System Alert",
-                    timestamp: serverTimestamp()
-                });
-                await batch.commit();
-                close();
-            };
-
-            // IMPOSTER ACTIONS
-            const doRemove = async () => {
-                if (!(await pay(config.costs.remove))) return;
-                await updateDoc(getGameRef(db, paths), { 'config.investigationsLeft': increment(-config.removeAmount) });
-                setMsg("Records deleted...");
-                setTimeout(close, 1000);
-            };
-
-            const doFake = async () => {
-                if (!(await pay(config.costs.fake))) return;
-                await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                    message: `${me.name} investigated [REDACTED]. Result: All Clear.`,
-                    source: "Investigation Terminal",
-                    timestamp: serverTimestamp()
-                });
-                setMsg("Fake log generated.");
-                setTimeout(close, 1000);
-            };
-
-            const doDisguise = async () => {
-                if (!(await pay(config.costs.disguise))) return;
-                await updateDoc(getPlayerRef(db, paths, pId), { investigatedStatus: 'Disguised' });
-                setMsg("Disguise active (1 Use)");
-                setTimeout(close, 1000);
-            };
-
-            return (
-                <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
-                    <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim max-h-[90vh] flex flex-col">
-                        <div className="flex justify-between items-center mb-6">
-                            <h2 className="text-2xl font-black uppercase text-cyan-400">
-                                {mode ? <button onClick={() => setMode(null)} className="text-sm mr-2 text-slate-400 hover:text-white">← BACK</button> : null}
-                                Mission Control
-                            </h2>
-                            <button onClick={close}><XCircle /></button>
-                        </div>
-                        
-                        {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded animate-pulse">{msg}</div>}
-                        
-                        {/* MODE: MAIN MENU */}
-                        {!mode && (
-                            <div className="grid grid-cols-2 gap-3 overflow-y-auto">
-                                {role === 'Crewmate' ? (
-                                    <>
-                                        <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
-                                        <ActionBtn icon={Lock} title="Private Inv." desc="Investigate a player privately." cost={config.costs.private} fullDesc="Check if a player is Crewmate or Imposter. Only you see the result." onClick={() => setMode('private')} />
-                                        <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & tell everyone." cost={config.costs.public} fullDesc="Check a player and broadcast the result to the Teacher's screen." onClick={() => setMode('public')} />
-                                        <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={triggerMeeting} color="red" />
-                                    </>
-                                ) : (
-                                    <>
-                                        <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool.`} onClick={doRemove} />
-                                        <ActionBtn icon={FileText} title="Fake Inv." desc="Pretend to investigate!" cost={config.costs.fake} fullDesc="Generates a fake 'All Clear' report on the public feed." onClick={doFake} />
-                                        <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear'." onClick={() => setMode('unclear')} />
-                                        <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={doDisguise} />
-                                    </>
-                                )}
-                            </div>
+                {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded animate-pulse">{msg}</div>}
+                
+                {/* MODE: MAIN MENU */}
+                {!mode && (
+                    <div className="grid grid-cols-2 gap-3 overflow-y-auto">
+                        {/* FIX #1: GHOST MENU */}
+                        {!me.isAlive ? (
+                            <>
+                                <div className="col-span-2 text-center text-slate-500 italic mb-2">Ghost Uplink Established</div>
+                                <ActionBtn icon={Zap} title="Donate to Crew" desc="Send energy to alive Crew." cost="ALL" fullDesc="Transfers all your collected energy to a random Crewmate." onClick={() => donateEnergy('Crewmate')} color="cyan" />
+                                <ActionBtn icon={Zap} title="Donate to Imposter" desc="Send energy to alive Imposters." cost="ALL" fullDesc="Transfers all your collected energy to a random Imposter." onClick={() => donateEnergy('Imposter')} color="red" />
+                            </>
+                        ) : (
+                            /* ALIVE PLAYERS MENU */
+                            role === 'Crewmate' ? (
+                                <>
+                                    <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
+                                    <ActionBtn icon={Lock} title="Private Inv." desc="Investigate privately." cost={config.costs.private} fullDesc="Check if a player is 'All Clear' or 'Inconclusive'. Only you see the result." onClick={() => setMode('private')} />
+                                    <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & Broadcast." cost={config.costs.public} fullDesc="Check a player and post the result to the Public Feed." onClick={() => setMode('public')} />
+                                    <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={triggerMeeting} color="red" />
+                                </>
+                            ) : (
+                                <>
+                                    <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool.`} onClick={doRemove} />
+                                    {/* FIX #3: FAKE INVESTIGATE IS NOW A SELECTION MODE */}
+                                    <ActionBtn icon={FileText} title="Fake Inv." desc="Create fake public log." cost={config.costs.fake} fullDesc="Select a player to generate a fake 'All Clear' report on the public feed." onClick={() => setMode('fake')} />
+                                    <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear'." onClick={() => setMode('unclear')} />
+                                    <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={doDisguise} />
+                                </>
+                            )
                         )}
+                    </div>
+                )}
 
-                        {/* MODE: PLAYER SELECTION (For Peek, Private, Public, Unclear) */}
-                        {mode && ['peek', 'private', 'public', 'unclear'].includes(mode) && (
-                            <div className="flex-1 overflow-y-auto">
-                                <h3 className="text-slate-400 mb-2 uppercase text-xs font-bold">Select Target:</h3>
-                                <div className="space-y-2">
-                                    {Object.values(players).filter(p => p.id !== pId && p.isAlive).map(p => (
-                                        <button 
-                                            key={p.id} 
-                                            onClick={() => handleTargetAction(p.id)}
-                                            className="w-full text-left p-3 bg-slate-800 hover:bg-cyan-900 rounded border border-slate-700 flex justify-between items-center"
-                                        >
-                                            <span className="font-bold">{p.name}</span>
-                                            <span className="text-xs text-slate-500">Select</span>
-                                        </button>
-                                    ))}
-                                    {Object.values(players).filter(p => p.id !== pId && p.isAlive).length === 0 && (
-                                        <div className="text-slate-500 italic text-center py-4">No viable targets found.</div>
-                                    )}
-                                </div>
-                            </div>
-                        )}
-
-                        <div className="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-500 flex justify-between items-center">
-                            <span>CURRENT ENERGY: <span className="text-yellow-400 font-bold">{energy}</span></span>
-                            {mode && <span className="uppercase text-cyan-400">{mode} MODE</span>}
+                {/* MODE: PLAYER SELECTION */}
+                {/* Added 'fake' to the list of modes that trigger selection */}
+                {mode && ['peek', 'private', 'public', 'unclear', 'fake'].includes(mode) && (
+                    <div className="flex-1 overflow-y-auto">
+                        <h3 className="text-slate-400 mb-2 uppercase text-xs font-bold">Select Target:</h3>
+                        <div className="space-y-2">
+                            {Object.values(players).filter(p => p.id !== pId && p.isAlive).map(p => (
+                                <button 
+                                    key={p.id} 
+                                    onClick={() => handleTargetAction(p.id)}
+                                    className="w-full text-left p-3 bg-slate-800 hover:bg-cyan-900 rounded border border-slate-700 flex justify-between items-center"
+                                >
+                                    <span className="font-bold">{p.name}</span>
+                                    <span className="text-xs text-slate-500">Select</span>
+                                </button>
+                            ))}
+                            {Object.values(players).filter(p => p.id !== pId && p.isAlive).length === 0 && (
+                                <div className="text-slate-500 italic text-center py-4">No viable targets found.</div>
+                            )}
                         </div>
                     </div>
+                )}
+
+                <div className="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-500 flex justify-between items-center">
+                    <span>CURRENT ENERGY: <span className="text-yellow-400 font-bold">{energy}</span></span>
+                    {mode && <span className="uppercase text-cyan-400">{mode} MODE</span>}
                 </div>
-            );
-        }
+            </div>
+        </div>
+    );
+}
 
         function ActionBtn({ icon: Icon, title, desc, fullDesc, cost, onClick, color = 'cyan' }) {
             const [showHelp, setShowHelp] = useState(false);
