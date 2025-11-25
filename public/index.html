@@ -1630,14 +1630,26 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                             <span className="text-[10px] uppercase text-slate-400 tracking-widest">Energy</span>
                             <div className="text-3xl font-mono font-bold text-yellow-400 flex items-center gap-1"><Zap fill="currentColor"/> {me.energy}</div>
                         </div>
-                        <button onClick={() => setMenuOpen(true)} className="bg-slate-700 hover:bg-slate-600 px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg">
-                            <Settings size={20} /> Mission Control
-                        </button>
-                    </div>
+<button onClick={() => setMenuOpen(true)} className="bg-slate-700 hover:bg-slate-600 px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg">
+                        <Settings size={20} /> Mission Control
+                    </button>
+                </div>
 
-                    {menuOpen && <MissionControl role={me.role} energy={me.energy} me={me} pId={pId} players={players} config={gameState.config} gameState={gameState} db={db} close={() => setMenuOpen(false)} setNote={setViewingNote} />}
-                    
-                    {noteOpen && (
+                {menuOpen && <MissionControl 
+                    role={me.role} 
+                    energy={me.energy} 
+                    me={me} 
+                    pId={pId} 
+                    players={players} 
+                    config={gameState.config} 
+                    gameState={gameState} 
+                    db={db} 
+                    classId={classId}
+                    close={() => setMenuOpen(false)} 
+                    setNote={setViewingNote} 
+                />}
+                
+                {noteOpen && (
                         <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 z-50">
                             <div className="bg-slate-800 w-full max-w-lg rounded-xl p-6">
                                 <div className="flex justify-between mb-4"><h2 className="font-bold flex gap-2"><FileText/> Log</h2><button onClick={()=>{updateDoc(getPlayerRef(db, paths, pId), {notes}); setNoteOpen(false)}}><XCircle/></button></div>
@@ -1660,82 +1672,195 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
         }
 
         // --- Mission Control ---
-        function MissionControl({ role, energy, me, pId, players, config, gameState, db, close, setNote }) {
+function MissionControl({ role, energy, me, pId, players, config, gameState, db, classId, close, setNote }) {
             const [msg, setMsg] = useState("");
-            const [mode, setMode] = useState(null); 
+            const [mode, setMode] = useState(null); // 'peek', 'private', 'public', etc.
             
-            // Need to re-derive paths here since we are inside a child component, but simpler is to just reuse the ones passed down?
-            // Actually, MissionControl is inside StudentInterface which HAS 'paths', but the functions (pay, doPeek) are defined INSIDE MissionControl
-            // which does NOT have access to 'paths' unless we pass it. 
-            // Wait - 'getGameRef' needs 'paths'.
-            // Let's get paths from context or props.
-            // Correction: StudentInterface already has 'classId', let's just re-derive paths or pass them.
-            // Optimization: Pass 'paths' directly? No, let's re-derive to keep props clean or just use context. 
-            // Simpler: Just use the classId from parent?
-            // Actually, let's look at StudentInterface. It passes 'db' but not 'classId' or 'paths' to MissionControl.
-            // I need to update StudentInterface to pass 'classId' to MissionControl.
-            
-            // Since I can't edit the component props easily without rewriting everything, 
-            // I will assume MissionControl receives `classId` via prop drilling if I add it below.
-            
-            // FIX: I will use a hook here to get paths from the classId that *should* be passed.
-            // I will update StudentInterface to pass classId.
-            
-            // (Self-correction: I will just add classId to the props in StudentInterface render)
-            
-            // Oh wait, MissionControl is defined inside the same scope? No, it's a separate function.
-            // It needs classId.
-            
-            // Let's pretend we passed it. I will update the StudentInterface render method in the final output to pass `classId={classId}`.
-        
-            // RE-READING: I already updated StudentInterface to accept classId.
-            // Now I need to update where MissionControl is CALLED inside StudentInterface.
-            
+            // Generate paths
+            const paths = useMemo(() => getPaths(classId), [classId]);
+
+            // Helper: Deduct energy
+            const pay = async (amount) => {
+                if (me.energy < amount) {
+                    setMsg("Not enough energy!");
+                    setTimeout(() => setMsg(""), 2000);
+                    return false;
+                }
+                const pRef = getPlayerRef(db, paths, pId);
+                await updateDoc(pRef, { energy: increment(-amount) });
+                return true;
+            };
+
+            // CREWMATE ACTIONS
+            const handleTargetAction = async (targetId) => {
+                const target = players[targetId];
+                if (!target) return;
+
+                if (mode === 'peek') {
+                    if (!(await pay(config.costs.peek))) return;
+                    setNote(target.notes || "This notebook is empty.");
+                    close();
+                }
+                else if (mode === 'private') {
+                    if (!(await pay(config.costs.private))) return;
+                    
+                    // Logic: Check if they are disguised or unclear
+                    let result = target.role;
+                    if (target.investigatedStatus === 'Disguised') result = 'Crewmate'; // False negative
+                    if (target.investigatedStatus === 'Unclear') result = 'Inconclusive';
+
+                    // Reset target status after check
+                    if (target.investigatedStatus !== 'Normal') {
+                        await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
+                    }
+
+                    alert(`INVESTIGATION RESULT:\n\n${target.name} is: ${result}`);
+                    close();
+                }
+                else if (mode === 'public') {
+                    if (!(await pay(config.costs.public))) return;
+
+                    let result = target.role;
+                    if (target.investigatedStatus === 'Disguised') result = 'Crewmate';
+                    if (target.investigatedStatus === 'Unclear') result = 'Inconclusive';
+
+                    if (target.investigatedStatus !== 'Normal') {
+                        await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
+                    }
+
+                    // Post to feed
+                    await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                        message: `${me.name} investigated ${target.name}. Result: ${result}`,
+                        source: "Investigation Terminal",
+                        timestamp: serverTimestamp()
+                    });
+                    
+                    // Decrement global investigations left
+                    await updateDoc(getGameRef(db, paths), { 
+                        'config.investigationsLeft': increment(-1) 
+                    });
+
+                    close();
+                }
+                else if (mode === 'unclear') {
+                     if (!(await pay(config.costs.unclear))) return;
+                     await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Unclear' });
+                     setMsg(`Sabotaged ${target.name}'s ID!`);
+                     setTimeout(close, 1000);
+                }
+            };
+
+            const triggerMeeting = async () => {
+                // Check cooldown
+                const now = new Date().getTime() / 1000;
+                const lastEnd = gameState.lastMeetingEnded ? gameState.lastMeetingEnded.seconds : 0;
+                const cooldown = config.meetingCooldown || 120;
+                
+                if (now - lastEnd < cooldown) {
+                    setMsg(`Systems cooling down... Wait ${Math.ceil(cooldown - (now - lastEnd))}s`);
+                    setTimeout(() => setMsg(""), 3000);
+                    return;
+                }
+
+                if (!(await pay(config.costs.emergency))) return;
+
+                const batch = writeBatch(db);
+                batch.update(getGameRef(db, paths), { phase: 'Meeting' });
+                batch.set(doc(collection(db, ...paths.games, GAME_ID, 'feed')), {
+                    message: `🚨 EMERGENCY MEETING CALLED BY ${me.name.toUpperCase()}!`,
+                    source: "System Alert",
+                    timestamp: serverTimestamp()
+                });
+                await batch.commit();
+                close();
+            };
+
+            // IMPOSTER ACTIONS
+            const doRemove = async () => {
+                if (!(await pay(config.costs.remove))) return;
+                await updateDoc(getGameRef(db, paths), { 'config.investigationsLeft': increment(-config.removeAmount) });
+                setMsg("Records deleted...");
+                setTimeout(close, 1000);
+            };
+
+            const doFake = async () => {
+                if (!(await pay(config.costs.fake))) return;
+                await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                    message: `${me.name} investigated [REDACTED]. Result: All Clear.`,
+                    source: "Investigation Terminal",
+                    timestamp: serverTimestamp()
+                });
+                setMsg("Fake log generated.");
+                setTimeout(close, 1000);
+            };
+
+            const doDisguise = async () => {
+                if (!(await pay(config.costs.disguise))) return;
+                await updateDoc(getPlayerRef(db, paths, pId), { investigatedStatus: 'Disguised' });
+                setMsg("Disguise active (1 Use)");
+                setTimeout(close, 1000);
+            };
+
             return (
                 <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
-                    <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim">
+                    <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim max-h-[90vh] flex flex-col">
                         <div className="flex justify-between items-center mb-6">
-                            <h2 className="text-2xl font-black uppercase text-cyan-400">Mission Control</h2>
+                            <h2 className="text-2xl font-black uppercase text-cyan-400">
+                                {mode ? <button onClick={() => setMode(null)} className="text-sm mr-2 text-slate-400 hover:text-white">← BACK</button> : null}
+                                Mission Control
+                            </h2>
                             <button onClick={close}><XCircle /></button>
                         </div>
-                        {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded">{msg}</div>}
                         
-                        <div className="grid grid-cols-2 gap-3">
-                            {role === 'Crewmate' ? (
-                                <>
-                                    <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
-                                    <ActionBtn icon={Lock} title="Private Inv." desc="Investigate a player privately." cost={config.costs.private} fullDesc="Check if a player is Crewmate or Imposter. Only you see the result." onClick={() => setMode('private')} />
-                                    <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & tell everyone." cost={config.costs.public} fullDesc="Check a player and broadcast the result to the Teacher's screen." onClick={() => setMode('public')} />
-                                    <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={async () => { 
-                                        // Re-implement trigger logic here if needed or pass function
-                                        // Actually, let's just implement the trigger here since we have the data
-                                        // We need the paths though.
-                                        // Let's tell the user to check the code block above where I implemented triggerMeeting inside StudentInterface
-                                        // and passed it down.
-                                        // WAIT. I didn't pass triggerMeeting to MissionControl in the previous step.
-                                        // To make this robust without massive refactoring, I will reimplement the logic here using paths.
-                                        
-                                        // ... logic ...
-                                        // You know what, let's keep it simple.
-                                        // I'll assume the 'triggerMeeting' function was passed as a prop? 
-                                        // No, that's messy.
-                                        
-                                        // Okay, I will add a `triggerMeeting` function inside StudentInterface and pass it to MissionControl.
-                                    }} color="red" />
-                                    {/* Wait, I can't easily change the onClick here without passing the function. */}
-                                    {/* I will assume I updated StudentInterface to pass `triggerMeeting` and use it here. */}
-                                </>
-                            ) : (
-                                <>
-                                    <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool. If it hits 0, Imposters win.`} onClick={() => setMode('remove')} /> 
-                                    {/* Note: I changed onClick to setMode to handle it via a unified handler or passed function */}
-                                    <ActionBtn icon={FileText} title="Fake Inv." desc="Pretend to investigate!" cost={config.costs.fake} fullDesc="Generates a fake 'All Clear' report on the public feed to make you look innocent." onClick={() => setMode('fake')} />
-                                    <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear' when investigated." onClick={() => setMode('unclear')} />
-                                    <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={() => setMode('disguise')} />
-                                </>
-                            )}
+                        {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded animate-pulse">{msg}</div>}
+                        
+                        {/* MODE: MAIN MENU */}
+                        {!mode && (
+                            <div className="grid grid-cols-2 gap-3 overflow-y-auto">
+                                {role === 'Crewmate' ? (
+                                    <>
+                                        <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
+                                        <ActionBtn icon={Lock} title="Private Inv." desc="Investigate a player privately." cost={config.costs.private} fullDesc="Check if a player is Crewmate or Imposter. Only you see the result." onClick={() => setMode('private')} />
+                                        <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & tell everyone." cost={config.costs.public} fullDesc="Check a player and broadcast the result to the Teacher's screen." onClick={() => setMode('public')} />
+                                        <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={triggerMeeting} color="red" />
+                                    </>
+                                ) : (
+                                    <>
+                                        <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool.`} onClick={doRemove} />
+                                        <ActionBtn icon={FileText} title="Fake Inv." desc="Pretend to investigate!" cost={config.costs.fake} fullDesc="Generates a fake 'All Clear' report on the public feed." onClick={doFake} />
+                                        <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear'." onClick={() => setMode('unclear')} />
+                                        <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={doDisguise} />
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                        {/* MODE: PLAYER SELECTION (For Peek, Private, Public, Unclear) */}
+                        {mode && ['peek', 'private', 'public', 'unclear'].includes(mode) && (
+                            <div className="flex-1 overflow-y-auto">
+                                <h3 className="text-slate-400 mb-2 uppercase text-xs font-bold">Select Target:</h3>
+                                <div className="space-y-2">
+                                    {Object.values(players).filter(p => p.id !== pId && p.isAlive).map(p => (
+                                        <button 
+                                            key={p.id} 
+                                            onClick={() => handleTargetAction(p.id)}
+                                            className="w-full text-left p-3 bg-slate-800 hover:bg-cyan-900 rounded border border-slate-700 flex justify-between items-center"
+                                        >
+                                            <span className="font-bold">{p.name}</span>
+                                            <span className="text-xs text-slate-500">Select</span>
+                                        </button>
+                                    ))}
+                                    {Object.values(players).filter(p => p.id !== pId && p.isAlive).length === 0 && (
+                                        <div className="text-slate-500 italic text-center py-4">No viable targets found.</div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-500 flex justify-between items-center">
+                            <span>CURRENT ENERGY: <span className="text-yellow-400 font-bold">{energy}</span></span>
+                            {mode && <span className="uppercase text-cyan-400">{mode} MODE</span>}
                         </div>
-                        <div className="mt-4 text-center text-xs text-slate-500">CURRENT ENERGY: {energy}</div>
                     </div>
                 </div>
             );
