@@ -1493,11 +1493,12 @@ useEffect(() => {
                 }
 
                 return { 
-                    q: safeQ.q, 
-                    shuffledOptions: options, 
-                    rawCorrectIndex: safeQ.correct 
-                };
-            }, [qIndex, gameState?.questions, questionQueue]);
+					q: safeQ.q, 
+					shuffledOptions: options, 
+					rawCorrectIndex: safeQ.correct 
+				};
+				// We use JSON.stringify so it only updates if the actual CONTENT of questions changes, not just the database reference
+			}, [qIndex, JSON.stringify(gameState?.questions), questionQueue]);
 
             const handleAns = async (selectedOption) => {
                 if (!currentQData || feedback) return;
