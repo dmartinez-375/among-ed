@@ -21,6 +21,7 @@
         }
 
         .fade-in { animation: fadeIn 1s ease-in forwards; }
+        .animate-fade-in { animation: fadeIn 0.6s ease-in forwards; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
         .drama-text { animation: dramaScale 3s ease-out forwards; }
@@ -97,7 +98,7 @@
         import { 
             getFirestore, collection, doc, setDoc, addDoc, updateDoc, 
             onSnapshot, increment, getDoc, getDocs, writeBatch, serverTimestamp, 
-            deleteDoc, deleteField
+            deleteDoc, deleteField, runTransaction, query, orderBy, limit
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- Configuration ---
@@ -133,6 +134,9 @@
             isDefault: true
         };
 
+        // Raw file cap for uploaded music. Base64 adds ~33%, and Firestore docs max out at 1 MiB.
+        const MAX_MUSIC_BYTES = 700 * 1000;
+
         const BTN_COLORS = [
             "bg-blue-600 hover:bg-blue-500",
             "bg-emerald-600 hover:bg-emerald-500",
@@ -151,14 +155,49 @@
             remove: 10, fake: 6, unclear: 15, disguise: 15
         };
 
-        const CSV_TEMPLATE = `"Among Ed Import",,,,,,,,
-Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
+        const CSV_TEMPLATE = `"Among Ed Import",,,,,
+Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
+"What is the capital of France?",Paris,London,Berlin,Rome,1`;
 
         // --- Helpers ---
-        // IMPORTANT: These now require 'paths' object to be passed in
+        // IMPORTANT: These require 'paths' object to be passed in
         const getGameRef = (db, paths) => doc(db, ...paths.games, GAME_ID);
         const getPlayerRef = (db, paths, uid) => doc(db, ...paths.games, GAME_ID, 'players', uid);
         const getRosterRef = (db, paths, name) => doc(db, ...paths.roster, name.toLowerCase().trim());
+
+        // COST FIX: fast-changing counters (energy/correct/incorrect/notes) live in games/{id}/stats/{uid},
+        // separate from players/{uid}. Answering a question therefore only notifies the student's own
+        // listener (plus the teacher's), instead of every student listening to the players collection.
+        const getStatsRef = (db, paths, uid) => doc(db, ...paths.games, GAME_ID, 'stats', uid);
+        const ZERO_STATS = { energy: 0, correct: 0, incorrect: 0, notes: '' };
+
+        // COST FIX: public feed is capped to the latest entries
+        const FEED_LIMIT = 30;
+
+        // PRESENCE: students ping stats/{uid}.lastSeen while their tab is visible. Anyone not seen
+        // within PRESENCE_SECONDS is treated as absent by the teacher dashboard.
+        const HEARTBEAT_MS = 45 * 1000;
+        const PRESENCE_SECONDS = 150;
+        const feedQuery = (db, paths) => query(
+            collection(db, ...paths.games, GAME_ID, 'feed'),
+            orderBy('timestamp', 'desc'),
+            limit(FEED_LIMIT)
+        );
+
+        // Pending serverTimestamp() writes have no seconds yet; treat them as "now" so sorting never yields NaN.
+        const feedTs = (f) => f.timestamp?.seconds ?? Date.now() / 1000;
+        const sortFeed = (arr) => arr.sort((a, b) => feedTs(b) - feedTs(a));
+
+        // Firestore batches are capped at 500 operations; run big jobs in chunks.
+        const runBatched = async (db, ops) => {
+            for (let i = 0; i < ops.length; i += 400) {
+                const b = writeBatch(db);
+                ops.slice(i, i + 400).forEach(fn => fn(b));
+                await b.commit();
+            }
+        };
+
+        const toInt = (v, fallback, min = 0) => (Number.isInteger(v) && v >= min ? v : fallback);
 
         const parseCSV = (text) => {
             const rows = [];
@@ -197,11 +236,25 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             return rows;
         };
 
+        function NumField({ value, onChange }) {
+            return (
+                <input
+                    type="number"
+                    className="w-16 bg-slate-800 p-1 rounded"
+                    value={Number.isFinite(value) ? value : ''}
+                    onChange={e => {
+                        const v = parseInt(e.target.value, 10);
+                        onChange(Number.isNaN(v) ? '' : v);
+                    }}
+                />
+            );
+        }
+
         // --- Main App ---
         function App() {
             const [user, setUser] = useState(null);
             const [role, setRole] = useState('student'); 
-            const [classId, setClassId] = useState(null); // NEW: Tracks selected class
+            const [classId, setClassId] = useState(null); // Tracks selected class
             const [name, setName] = useState('');
             const [password, setPassword] = useState('');
             const [showPassword, setShowPassword] = useState(false);
@@ -248,9 +301,15 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                         if (password === serverPass) { setRole('teacher'); setJoined(true); }
                         else setErrorMsg("Invalid Command Code");
                     } else {
-                        // Check Lock
-                        const gameSnap = await getDoc(getGameRef(db, paths));
-                        if (gameSnap.exists() && gameSnap.data().isLocked) {
+                        const pid = name.toLowerCase().trim();
+
+                        // FIX #2: The lock only blocks NEW cadets. Anyone who already has a
+                        // player doc (refresh, dropped connection) can always get back in.
+                        const [gameSnap, existingPlayer] = await Promise.all([
+                            getDoc(getGameRef(db, paths)),
+                            getDoc(getPlayerRef(db, paths, pid))
+                        ]);
+                        if (gameSnap.exists() && gameSnap.data().isLocked && !existingPlayer.exists()) {
                             return setErrorMsg("Game is locked. No new cadets.");
                         }
 
@@ -352,11 +411,10 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const paths = useMemo(() => getPaths(classId), [classId]);
 
             useEffect(() => {
-                const unsubFeed = onSnapshot(collection(db, ...paths.games, GAME_ID, 'feed'), (snap) => {
+                const unsubFeed = onSnapshot(feedQuery(db, paths), (snap) => {
                     const f = [];
                     snap.forEach(doc => f.push({id: doc.id, ...doc.data()}));
-                    f.sort((a, b) => b.timestamp?.seconds - a.timestamp?.seconds);
-                    setFeed(f);
+                    setFeed(sortFeed(f));
                 });
                 const unsubGame = onSnapshot(getGameRef(db, paths), (snap) => {
                     if(snap.exists()) setGameState(snap.data());
@@ -400,7 +458,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
         }
 
         // --- Screens & Animations ---
-        function WinScreen({ winner, players }) {
+        function WinScreen({ winner, players, onDismiss }) {
             const isImp = winner === 'Imposters';
             const imposterNames = Object.values(players || {})
                 .filter(p => p.role === 'Imposter')
@@ -416,6 +474,11 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                             <span className="text-slate-400">The Imposters were:</span>
                             <div className="font-bold mt-2 text-red-500 text-4xl">{imposterNames}</div>
                         </div>
+                    )}
+                    {onDismiss && (
+                        <button onClick={onDismiss} className="mt-12 bg-slate-700 hover:bg-slate-600 text-white px-6 py-3 rounded-full font-bold text-base">
+                            Back to Mission Control
+                        </button>
                     )}
                 </div>
             );
@@ -514,11 +577,26 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
         function TeacherDashboard({ user, db, classId }) {
             const [gameState, setGameState] = useState(null);
             const [players, setPlayers] = useState({});
+            const [stats, setStats] = useState({}); // { [uid]: {energy, correct, incorrect, notes, lastSeen} }
+
+            // --- PRESENCE ---
+            const [nowSec, setNowSec] = useState(() => Date.now() / 1000);
+            const [clockOffset, setClockOffset] = useState(0); // server time - this device's time, in ms
+            const clockOffsetSetRef = useRef(false);
+            const probeNonceRef = useRef(Math.random().toString(36).slice(2));
+            const isPresent = (pid) => {
+                const ls = stats[pid]?.lastSeen?.seconds;
+                return !!ls && (nowSec + clockOffset / 1000) - ls < PRESENCE_SECONDS;
+            };
             const [config, setConfig] = useState({ 
                 imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, meetingCooldown: 120, costs: DEFAULT_COSTS 
             });
+            // FIX #4: only pull config from Firestore once, so later game-doc writes
+            // (like toggling the lock) don't wipe the teacher's unsaved edits.
+            const configLoadedRef = useRef(false);
             const [showStats, setShowStats] = useState(false);
             const [view, setView] = useState('game'); 
+            const [winDismissed, setWinDismissed] = useState(false);
             
             // --- MUSIC PLAYER STATE ---
             const [musicLibrary, setMusicLibrary] = useState([DEFAULT_TRACK]);
@@ -530,6 +608,16 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const [isMuted, setIsMuted] = useState(false);
             const [showMusicManager, setShowMusicManager] = useState(false);
             const audioRef = useRef(null);
+
+            // FIX #5/#6: refs so the one-time 'ended' listener and the Firestore listener always see fresh state
+            const musicLibraryRef = useRef(musicLibrary);
+            const isShufflingRef = useRef(isShuffling);
+            const isPlayingRef = useRef(isPlaying);
+            const loadedTrackIdRef = useRef(null);
+            const userPickedTrackRef = useRef(false);
+            useEffect(() => { musicLibraryRef.current = musicLibrary; }, [musicLibrary]);
+            useEffect(() => { isShufflingRef.current = isShuffling; }, [isShuffling]);
+            useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
             
             // Music Upload/Edit State
             const [uploadName, setUploadName] = useState('');
@@ -554,24 +642,58 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const [showQuestionEditor, setShowQuestionEditor] = useState(false);
             const [localQuestions, setLocalQuestions] = useState([]);
 
+            // Guards endMeeting so auto-end + force-end can't both run
+            const endingRef = useRef(false);
+
             // Paths specific to the selected class
             const paths = useMemo(() => getPaths(classId), [classId]);
 
+            // --- PRESENCE: clock probe + re-evaluation tick ---
+            useEffect(() => {
+                // Server-timestamp probe so presence doesn't depend on this device's clock being right
+                setDoc(getStatsRef(db, paths, '__teacher'), { probe: serverTimestamp(), nonce: probeNonceRef.current }).catch(() => {});
+            }, [db, paths]);
+
+            useEffect(() => {
+                const id = setInterval(() => setNowSec(Date.now() / 1000), 10000);
+                return () => clearInterval(id);
+            }, []);
+
             // --- AUDIO LOGIC ---
             useEffect(() => {
-                audioRef.current = new Audio();
-                audioRef.current.volume = volume;
-                
-                audioRef.current.addEventListener('ended', handleTrackEnd);
+                const audio = new Audio();
+                audio.volume = volume;
+                audio.loop = isLooping;
+                audioRef.current = audio;
 
-                return () => {
-                    if (audioRef.current) {
-                        audioRef.current.pause();
-                        audioRef.current.removeEventListener('ended', handleTrackEnd);
-                        audioRef.current = null;
+                // Only fires when loop is off (audio.loop suppresses 'ended')
+                const onEnded = () => {
+                    const lib = musicLibraryRef.current;
+                    if (isShufflingRef.current && lib.length > 0) {
+                        const next = lib[Math.floor(Math.random() * lib.length)];
+                        if (next.id === loadedTrackIdRef.current) {
+                            audio.currentTime = 0;
+                            audio.play().catch(() => {});
+                        } else {
+                            setCurrentTrack(next);
+                        }
+                    } else {
+                        setIsPlaying(false);
                     }
                 };
+                audio.addEventListener('ended', onEnded);
+
+                return () => {
+                    audio.pause();
+                    audio.removeEventListener('ended', onEnded);
+                    audioRef.current = null;
+                };
             }, []);
+
+            // Loop toggle
+            useEffect(() => {
+                if (audioRef.current) audioRef.current.loop = isLooping;
+            }, [isLooping]);
 
             // Handle Volume / Mute
             useEffect(() => {
@@ -580,91 +702,94 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
 
             // Handle Track Changes / Play State
             useEffect(() => {
-                if(!audioRef.current) return;
-                
-                const currentSrc = audioRef.current.src;
-                if(currentTrack.url && currentSrc !== currentTrack.url) {
-                    audioRef.current.src = currentTrack.url;
-                    audioRef.current.load();
-                    if(isPlaying) {
-                        const playPromise = audioRef.current.play();
-                        if(playPromise) playPromise.catch(e => console.log("Play interrupted or waiting interact", e));
-                    }
+                const a = audioRef.current;
+                if (!a) return;
+
+                if (currentTrack.url && loadedTrackIdRef.current !== currentTrack.id) {
+                    a.src = currentTrack.url;
+                    loadedTrackIdRef.current = currentTrack.id;
+                    a.load();
+                }
+                if (isPlaying) {
+                    const playPromise = a.play();
+                    if (playPromise) playPromise.catch(e => console.log("Play interrupted or waiting for interaction", e));
                 } else {
-                    if (isPlaying) {
-                        const playPromise = audioRef.current.play();
-                        if(playPromise) playPromise.catch(e => console.log("Play interrupted", e));
-                    } else {
-                        audioRef.current.pause();
-                    }
+                    a.pause();
                 }
             }, [currentTrack, isPlaying]);
 
-            const handleTrackEnd = () => {
-                if (isLooping) {
-                    audioRef.current.currentTime = 0;
-                    audioRef.current.play();
-                } else if (isShuffling) {
-                    const randomIdx = Math.floor(Math.random() * musicLibrary.length);
-                    setCurrentTrack(musicLibrary[randomIdx]);
-                } else {
-                    setIsPlaying(false);
-                }
-            };
-
             const togglePlay = () => setIsPlaying(!isPlaying);
+
+            const pickTrack = (track) => {
+                userPickedTrackRef.current = true;
+                setCurrentTrack(track);
+            };
 
             // Music Library Persistence
             useEffect(() => {
                 const unsubMusic = onSnapshot(collection(db, ...paths.music), (snap) => {
-                    const tracks = [DEFAULT_TRACK]; 
-                    let defaultToPlay = DEFAULT_TRACK;
-                    
-                    snap.forEach(doc => {
-                        const t = { id: doc.id, ...doc.data() };
-                        tracks.push(t);
-                        if(t.isDefault) defaultToPlay = t;
-                    });
-                    
+                    const custom = [];
+                    snap.forEach(d => custom.push({ id: d.id, ...d.data() }));
+
+                    // The built-in track is the default unless a custom track is starred
+                    const hasCustomDefault = custom.some(t => t.isDefault);
+                    const tracks = [{ ...DEFAULT_TRACK, isDefault: !hasCustomDefault }, ...custom];
                     setMusicLibrary(tracks);
-                    
-                    if(!audioRef.current.src && defaultToPlay) {
-                        setCurrentTrack(defaultToPlay);
+
+                    // Apply the saved default until the teacher picks something themselves
+                    if (!userPickedTrackRef.current && !isPlayingRef.current) {
+                        const def = tracks.find(t => t.isDefault) || tracks[0];
+                        setCurrentTrack(prev => (prev.id === def.id ? prev : def));
                     }
                 });
                 return () => unsubMusic();
             }, [db, paths]);
 
-            const handleMusicUpload = async (e) => {
-                const file = e.target.files[0];
-                if (!file || !uploadName) return alert("Name and File required");
-                if (file.size > 900000) return alert("File too large for this database (Limit: 900KB). Please use a URL for longer tracks.");
+            const handleMusicUpload = (e) => {
+                const input = e.target;
+                const file = input.files[0];
+                if (!file) return;
+                if (!uploadName.trim()) { alert("Enter a track name first."); input.value = ''; return; }
+                if (file.size > MAX_MUSIC_BYTES) {
+                    alert("File too large for this database (limit ~700KB). Please use a URL for longer tracks.");
+                    input.value = '';
+                    return;
+                }
 
                 const reader = new FileReader();
                 reader.onload = async (evt) => {
-                    const base64 = evt.target.result;
-                    await addDoc(collection(db, ...paths.music), {
-                        name: uploadName,
-                        url: base64,
-                        isDefault: false,
-                        createdAt: serverTimestamp()
-                    });
-                    setUploadName('');
-                    if(fileInputRefMusic.current) fileInputRefMusic.current.value = '';
+                    try {
+                        await addDoc(collection(db, ...paths.music), {
+                            name: uploadName.trim(),
+                            url: evt.target.result,
+                            isDefault: false,
+                            createdAt: serverTimestamp()
+                        });
+                        setUploadName('');
+                    } catch (err) {
+                        alert("Upload failed: " + err.message);
+                    } finally {
+                        if (fileInputRefMusic.current) fileInputRefMusic.current.value = '';
+                    }
                 };
+                reader.onerror = () => alert("Could not read that file.");
                 reader.readAsDataURL(file);
             };
 
             const handleUrlAdd = async () => {
                 if (!uploadUrl || !uploadName) return alert("Name and URL required");
-                await addDoc(collection(db, ...paths.music), {
-                    name: uploadName,
-                    url: uploadUrl,
-                    isDefault: false,
-                    createdAt: serverTimestamp()
-                });
-                setUploadName('');
-                setUploadUrl('');
+                try {
+                    await addDoc(collection(db, ...paths.music), {
+                        name: uploadName,
+                        url: uploadUrl,
+                        isDefault: false,
+                        createdAt: serverTimestamp()
+                    });
+                    setUploadName('');
+                    setUploadUrl('');
+                } catch (err) {
+                    alert("Could not add track: " + err.message);
+                }
             }
 
             const deleteTrack = async (id) => {
@@ -682,7 +807,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     }
                 });
                 await batch.commit();
-                alert("New default set. Refresh to apply on startup.");
+                alert("Default track updated. It will load automatically next time.");
             };
 
             // --- END AUDIO LOGIC ---
@@ -691,17 +816,34 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 const unsubGame = onSnapshot(getGameRef(db, paths), (snap) => {
                     if (snap.exists()) {
                         setGameState(snap.data());
-                        if (snap.data().config) setConfig(prev => ({...prev, ...snap.data().config}));
+                        const c = snap.data().config;
+                        if (c && !configLoadedRef.current) {
+                            configLoadedRef.current = true;
+                            setConfig(prev => ({ ...prev, ...c, costs: { ...DEFAULT_COSTS, ...(c.costs || {}) } }));
+                        }
                     } else {
                         setDoc(getGameRef(db, paths), {
                             status: 'Lobby', phase: 'Lobby',
                             config: { imposterCount: 1, meetingsEnabled: true, invRatio: 5, removeAmount: 10, meetingCooldown: 120, costs: DEFAULT_COSTS },
-                            teacherPassword: 'admin', questions: DEFAULT_QUESTIONS, isLocked: false
+                            teacherPassword: 'admin', questions: DEFAULT_QUESTIONS, isLocked: false, skipVotes: 0
                         });
                     }
                 });
                 const unsubPlayers = onSnapshot(collection(db, ...paths.games, GAME_ID, 'players'), (s) => {
                     const p = {}; s.forEach(d => p[d.id] = {id:d.id, ...d.data()}); setPlayers(p);
+                });
+                const unsubStats = onSnapshot(collection(db, ...paths.games, GAME_ID, 'stats'), (s) => {
+                    const m = {};
+                    s.forEach(d => {
+                        const x = d.data();
+                        m[d.id] = x;
+                        if (d.id === '__teacher' && !clockOffsetSetRef.current && x.nonce === probeNonceRef.current
+                            && x.probe?.seconds && !d.metadata.hasPendingWrites) {
+                            clockOffsetSetRef.current = true;
+                            setClockOffset(x.probe.seconds * 1000 - Date.now());
+                        }
+                    });
+                    setStats(m);
                 });
                 const unsubQS = onSnapshot(collection(db, ...paths.questionSets), (snap) => {
                     const qs = [];
@@ -715,14 +857,13 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                     setRoster(r);
                 });
                 
-                const unsubFeed = onSnapshot(collection(db, ...paths.games, GAME_ID, 'feed'), (snap) => {
+                const unsubFeed = onSnapshot(feedQuery(db, paths), (snap) => {
                     const f = [];
                     snap.forEach(doc => f.push({id: doc.id, ...doc.data()}));
-                    f.sort((a, b) => b.timestamp?.seconds - a.timestamp?.seconds);
-                    setFeed(f);
+                    setFeed(sortFeed(f));
                 });
 
-                return () => { unsubGame(); unsubPlayers(); unsubQS(); unsubRoster(); unsubFeed(); };
+                return () => { unsubGame(); unsubPlayers(); unsubStats(); unsubQS(); unsubRoster(); unsubFeed(); };
             }, [db, paths]);
 
             // Sync Local Questions when Editor opens
@@ -730,39 +871,76 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 if (showQuestionEditor && gameState?.questions) {
                     setLocalQuestions(JSON.parse(JSON.stringify(gameState.questions)));
                 }
-            }, [showQuestionEditor, gameState]);
+            }, [showQuestionEditor]);
+
+            // Re-arm the end-meeting guard once the meeting phase is over
+            useEffect(() => {
+                if (gameState?.phase !== 'Meeting') endingRef.current = false;
+            }, [gameState?.phase]);
+
+            // Let the teacher see the win screen again after a new winner is declared / game resets
+            useEffect(() => {
+                if (!gameState?.winner) setWinDismissed(false);
+            }, [gameState?.winner]);
 
             // Auto-End Voting Logic
             useEffect(() => {
                 if (gameState?.phase === 'Meeting') {
-                    const alivePlayers = Object.values(players).filter(p => p.isAlive);
-                    const votedCount = alivePlayers.filter(p => p.hasVoted).length;
-                    if (alivePlayers.length > 0 && votedCount === alivePlayers.length) {
+                    // Absent players (closed tab / lost connection) don't hold up the vote; anyone who voted still counts.
+                    const eligible = Object.values(players).filter(p => p.isAlive && (p.hasVoted || isPresent(p.id)));
+                    const votedCount = eligible.filter(p => p.hasVoted).length;
+                    if (eligible.length > 0 && votedCount === eligible.length) {
                         endMeeting(); 
                     }
                 }
-            }, [players, gameState?.phase]);
+            }, [players, stats, nowSec, clockOffset, gameState?.phase]);
 
             const startGame = async () => {
-                const pIds = Object.keys(players);
-                if (pIds.length < 3) return alert("Need 3+ players");
+                const allIds = Object.keys(players);
+                const pIds = allIds.filter(isPresent);
+                const absentIds = allIds.filter(id => !isPresent(id));
+                if (pIds.length < 3) {
+                    return alert(`Need 3+ cadets online (${pIds.length} seen in the last ${PRESENCE_SECONDS / 60} minutes). If students are logged in, ask them to reload the page.`);
+                }
+                if (absentIds.length) {
+                    const names = absentIds.map(id => players[id]?.name || id).join(', ');
+                    if (!confirm(`${absentIds.length} cadet(s) haven't been seen in the last ${PRESENCE_SECONDS / 60} minutes:\n\n${names}\n\nStart without them? They'll be removed from this round. (If you unlock the game later, they can rejoin as Crewmates.)`)) return;
+                }
+
+                // FIX #4: sanitize number inputs (empty box / NaN would otherwise break slice())
+                const maxImps = Math.max(1, Math.floor((pIds.length - 1) / 2));
+                const impCount = Math.min(maxImps, toInt(config.imposterCount, 1, 1));
+                if (impCount !== config.imposterCount) alert(`Imposter count adjusted to ${impCount} for ${pIds.length} players.`);
+                const invRatio = toInt(config.invRatio, 5, 1);
+                const removeAmount = toInt(config.removeAmount, 10, 0);
+                const meetingCooldown = toInt(config.meetingCooldown, 120, 0);
                 
-                const imposters = [...pIds].sort(()=>0.5-Math.random()).slice(0, config.imposterCount);
+                const imposters = [...pIds].sort(()=>0.5-Math.random()).slice(0, impCount);
                 const batch = writeBatch(db);
+
+                absentIds.forEach(id => {
+                    batch.delete(getPlayerRef(db, paths, id));
+                    batch.delete(getStatsRef(db, paths, id));
+                });
                 
                 pIds.forEach(pid => {
                     batch.update(getPlayerRef(db, paths, pid), {
                         role: imposters.includes(pid) ? 'Imposter' : 'Crewmate',
-                        isAlive: true, energy: 0, investigatedStatus: 'Normal',
-                        votes: 0, correct: 0, incorrect: 0, hasVoted: false, notes: ""
+                        isAlive: true, investigatedStatus: 'Normal',
+                        votes: 0, hasVoted: false
                     });
+                    batch.set(getStatsRef(db, paths, pid), ZERO_STATS);
                 });
 
                 batch.set(getGameRef(db, paths), {
                     status: 'Active', phase: 'Game', startTime: serverTimestamp(),
-                    config: { ...config, investigationsLeft: Math.floor(pIds.length * config.invRatio) },
+                    config: {
+                        ...config,
+                        imposterCount: impCount, invRatio, removeAmount, meetingCooldown,
+                        investigationsLeft: Math.floor(pIds.length * invRatio)
+                    },
                     ejectionData: deleteField(), winner: deleteField(),
-                    isLocked: true, lastMeetingEnded: deleteField() 
+                    isLocked: true, lastMeetingEnded: deleteField(), skipVotes: 0
                 }, { merge: true });
 
                 // Start Game Feed Message
@@ -776,6 +954,8 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 await batch.commit();
             };
 
+            // Ejects a player and starts the ejection sequence. The win check now happens
+            // in resumeGame, AFTER the reveal, instead of on a fragile 9s timer in this tab.
             const handleEject = async (playerId) => {
                 const p = players[playerId];
                 if (!p) return;
@@ -784,7 +964,6 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 batch.update(getGameRef(db, paths), { phase: 'Ejecting', ejectionData: { name: p.name, role: p.role } });
                 batch.update(getPlayerRef(db, paths, playerId), { isAlive: false });
                 
-                // Voting Result Feed Message
                 const feedRef = collection(db, ...paths.games, GAME_ID, 'feed');
                 batch.set(doc(feedRef), {
                     message: `${p.name} was voted out. They were a ${p.role}.`,
@@ -793,95 +972,117 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                 });
 
                 await batch.commit();
-
-                const remainingPlayers = Object.values(players).filter(pl => pl.isAlive && pl.id !== playerId);
-                const activeImposters = remainingPlayers.filter(pl => pl.role === 'Imposter').length;
-                const totalAlive = remainingPlayers.length;
-                
-                // Game Over Checks
-                if (activeImposters === 0) {
-                    setTimeout(async () => {
-                        await updateDoc(getGameRef(db, paths), { winner: 'Crewmates', phase: 'GameOver' });
-                         await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                            message: "GAME OVER: Crewmates Win! All Imposters eliminated.",
-                            source: "System",
-                            timestamp: serverTimestamp()
-                        });
-                    }, 9000); 
-                } 
-                else if (totalAlive <= 2 && activeImposters >= 1) {
-                        setTimeout(async () => {
-                        await updateDoc(getGameRef(db, paths), { winner: 'Imposters', phase: 'GameOver' });
-                        // Get Imposter Names for feed
-                        const imps = Object.values(players).filter(pl => pl.role === 'Imposter').map(i => i.name).join(', ');
-                        await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                            message: `GAME OVER: Imposters Win! The Imposters were: ${imps}`,
-                            source: "System",
-                            timestamp: serverTimestamp()
-                        });
-                    }, 9000);
-                }
             };
 
+            // FIX #3: Teacher clicks "Resume" after the role reveal -> check for a winner now.
             const resumeGame = async () => {
-                await updateDoc(getGameRef(db, paths), { phase: 'Game', ejectionData: deleteField() });
-            }
+                const alive = Object.values(players).filter(pl => pl.isAlive);
+                const aliveImposters = alive.filter(pl => pl.role === 'Imposter').length;
+                const imposterNames = Object.values(players).filter(pl => pl.role === 'Imposter').map(i => i.name).join(', ');
 
-            const endMeeting = async () => {
-                let maxVotes = -1;
-                let candidate = null;
-                Object.values(players).forEach(p => {
-                    if (p.votes > maxVotes) { maxVotes = p.votes; candidate = p; }
-                    else if (p.votes === maxVotes) candidate = null; // Tie
-                });
+                let winner = null;
+                if (aliveImposters === 0) winner = 'Crewmates';
+                else if (alive.length <= 2) winner = 'Imposters';
 
-                const batch = writeBatch(db);
-                Object.keys(players).forEach(pid => batch.update(getPlayerRef(db, paths, pid), { votes: 0, hasVoted: false }));
-                
-                // Record time meeting ended for cooldown logic
-                batch.update(getGameRef(db, paths), { lastMeetingEnded: serverTimestamp() });
-                
-                await batch.commit();
-
-                if (candidate && maxVotes > 0) handleEject(candidate.id);
-                else {
-                     updateDoc(getGameRef(db, paths), { phase: 'Game' }); // Tie or skip
-                     addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                        message: "Vote result: Tie or Skip. No one was ejected.",
+                if (winner) {
+                    await updateDoc(getGameRef(db, paths), { winner, phase: 'GameOver', ejectionData: deleteField() });
+                    await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                        message: winner === 'Crewmates'
+                            ? "GAME OVER: Crewmates Win! All Imposters eliminated."
+                            : `GAME OVER: Imposters Win! The Imposters were: ${imposterNames}`,
                         source: "System",
                         timestamp: serverTimestamp()
                     });
+                } else {
+                    await updateDoc(getGameRef(db, paths), { phase: 'Game', ejectionData: deleteField() });
+                }
+            }
+
+            // FIX #1: skip votes are tallied on the game doc and compared against the top player
+            const endMeeting = async () => {
+                if (endingRef.current) return;
+                endingRef.current = true;
+                try {
+                    const alive = Object.values(players).filter(p => p.isAlive);
+                    const skipVotes = gameState?.skipVotes || 0;
+
+                    let maxVotes = 0;
+                    let leaders = [];
+                    alive.forEach(p => {
+                        const v = p.votes || 0;
+                        if (v > maxVotes) { maxVotes = v; leaders = [p]; }
+                        else if (v === maxVotes && v > 0) leaders.push(p);
+                    });
+
+                    const ops = Object.keys(players).map(pid => (b) => b.update(getPlayerRef(db, paths, pid), { votes: 0, hasVoted: false }));
+                    ops.push((b) => b.update(getGameRef(db, paths), { lastMeetingEnded: serverTimestamp(), skipVotes: 0 }));
+                    await runBatched(db, ops);
+
+                    if (leaders.length === 1 && maxVotes > skipVotes) {
+                        await handleEject(leaders[0].id);
+                    } else {
+                        const reason = (skipVotes >= maxVotes && skipVotes > 0) ? "Skip won the vote" : "Tie vote";
+                        await updateDoc(getGameRef(db, paths), { phase: 'Game' });
+                        await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                            message: `Vote result: ${reason}. No one was ejected.`,
+                            source: "System",
+                            timestamp: serverTimestamp()
+                        });
+                    }
+                } catch (err) {
+                    console.error("endMeeting failed", err);
+                    endingRef.current = false;
                 }
             };
 
             const confirmReset = async () => {
-                const batch = writeBatch(db);
-                batch.update(getGameRef(db, paths), { status: 'Lobby', phase: 'Lobby', ejectionData: deleteField(), winner: deleteField(), isLocked: false, lastMeetingEnded: deleteField() });
-                
-                Object.keys(players).forEach(pid => batch.update(getPlayerRef(db, paths, pid), { 
-                    role:'Pending', isAlive:true, energy:0, correct:0, incorrect:0, votes:0, hasVoted:false, notes: ""
-                }));
-
                 const feedSnapshot = await getDocs(collection(db, ...paths.games, GAME_ID, 'feed'));
-                feedSnapshot.forEach((doc) => {
-                    batch.delete(doc.ref);
+                const ops = [];
+                ops.push((b) => b.update(getGameRef(db, paths), { status: 'Lobby', phase: 'Lobby', ejectionData: deleteField(), winner: deleteField(), isLocked: false, lastMeetingEnded: deleteField(), skipVotes: 0 }));
+                Object.keys(players).forEach(pid => {
+                    ops.push((b) => b.update(getPlayerRef(db, paths, pid), { 
+                        role:'Pending', isAlive:true, votes:0, hasVoted:false, investigatedStatus: 'Normal'
+                    }));
+                    ops.push((b) => b.set(getStatsRef(db, paths, pid), ZERO_STATS));
                 });
+                feedSnapshot.forEach((d) => ops.push((b) => b.delete(d.ref)));
 
-                await batch.commit();
+                await runBatched(db, ops);
                 setShowStats(false);
+                setWinDismissed(false);
             };
 
             const removePlayer = async (id) => {
-                if(confirm("Remove player?")) deleteDoc(getPlayerRef(db, paths, id));
+                if(confirm("Remove player?")) {
+                    const b = writeBatch(db);
+                    b.delete(getPlayerRef(db, paths, id));
+                    b.delete(getStatsRef(db, paths, id));
+                    await b.commit();
+                }
             };
 
             const removeAllPlayers = async () => {
                 if (!confirm("WARNING: This will remove ALL players from the game. This cannot be undone. Are you sure?")) return;
-                const batch = writeBatch(db);
+                const ops = [];
                 Object.keys(players).forEach(pid => {
-                    batch.delete(getPlayerRef(db, paths, pid));
+                    ops.push((b) => b.delete(getPlayerRef(db, paths, pid)));
+                    ops.push((b) => b.delete(getStatsRef(db, paths, pid)));
                 });
-                await batch.commit();
+                await runBatched(db, ops);
+            };
+
+            // Drops cadets who haven't been seen recently (stale rows from earlier sessions, closed tabs)
+            const removeAbsent = async () => {
+                const absent = Object.values(players).filter(p => !isPresent(p.id));
+                if (absent.length === 0) return alert("Everyone on the manifest has been seen recently.");
+                const names = absent.map(p => p.name).join(', ');
+                if (!confirm(`Remove ${absent.length} cadet(s) not seen in the last ${PRESENCE_SECONDS / 60} minutes?\n\n${names}`)) return;
+                const ops = [];
+                absent.forEach(p => {
+                    ops.push((b) => b.delete(getPlayerRef(db, paths, p.id)));
+                    ops.push((b) => b.delete(getStatsRef(db, paths, p.id)));
+                });
+                await runBatched(db, ops);
             };
 
             // Roster Actions
@@ -946,29 +1147,64 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const deleteQuestionSet = async (id) => {
                 if (confirm("Delete?")) await deleteDoc(doc(db, ...paths.questionSets, id));
             };
+
+            // FIX #8: robust CSV import
             const handleFileUpload = (e) => {
-                const file = e.target.files[0];
-                if (!file || !newSetName.trim()) return alert("Need File & Name");
+                const input = e.target;
+                const file = input.files[0];
+                if (!file || !newSetName.trim()) { input.value = ''; return alert("Need File & Name"); }
                 const reader = new FileReader();
                 reader.onload = async (evt) => {
-                    const rows = parseCSV(evt.target.result);
+                    const text = String(evt.target.result).replace(/^\uFEFF/, ''); // strip BOM
+                    const rows = parseCSV(text);
                     const newQs = [];
-                    for (let i = 1; i < rows.length; i++) { 
-                        const r = rows[i];
-                        if (r.length < 3) continue;
-                        const qText = r[0];
-                        const ans = [r[1], r[2], r[3], r[4]].filter(a=>a);
-                        let cIdx = parseInt(r[5] || "1") - 1;
-                        if (cIdx < 0 || cIdx >= ans.length) cIdx = 0;
-                        if(qText && ans.length>1) newQs.push({q:qText, a:ans, correct:cIdx});
+                    let skipped = 0;
+
+                    for (const r of rows) {
+                        const first = (r[0] || '').trim();
+                        if (!first) continue;                                     // blank row
+                        if (/^among ed import$/i.test(first)) continue;           // title row
+                        if (/^question$/i.test(first)) continue;                  // header row
+
+                        const raw = [r[1], r[2], r[3], r[4]].map(a => (a || '').trim());
+                        const cIdx = (r[5] === undefined || r[5] === '') ? 0 : parseInt(r[5], 10) - 1;
+
+                        // Correct index must be 1-4 and point at a non-blank answer
+                        if (!(cIdx >= 0 && cIdx < 4) || !raw[cIdx]) { skipped++; continue; }
+
+                        // Drop blank answers but keep "correct" pointing at the right one
+                        const ans = [];
+                        let correct = 0;
+                        raw.forEach((a, i) => {
+                            if (!a) return;
+                            if (i === cIdx) correct = ans.length;
+                            ans.push(a);
+                        });
+                        if (ans.length < 2) { skipped++; continue; }
+
+                        newQs.push({ q: first, a: ans, correct });
                     }
+
                     if (newQs.length) {
-                        await addDoc(collection(db, ...paths.questionSets), { name: newSetName, questions: newQs, createdAt: serverTimestamp() });
-                        setImportMode(false); setNewSetName('');
-                    } else alert("No valid questions");
+                        try {
+                            await addDoc(collection(db, ...paths.questionSets), { name: newSetName.trim(), questions: newQs, createdAt: serverTimestamp() });
+                            setImportMode(false); setNewSetName('');
+                            alert(`Imported ${newQs.length} questions.` + (skipped ? ` Skipped ${skipped} invalid row(s).` : ''));
+                        } catch (err) {
+                            alert("Import failed: " + err.message);
+                        }
+                    } else {
+                        alert("No valid questions found." + (skipped ? ` (${skipped} row(s) skipped - check the Correct Index column.)` : ''));
+                    }
+                    input.value = '';
                 };
                 reader.readAsText(file);
             };
+
+            // Teacher now sees the win screen too
+            if (gameState?.winner && !winDismissed) {
+                return <WinScreen winner={gameState.winner} players={players} onDismiss={() => setWinDismissed(true)} />;
+            }
 
             return (
                 <div className="min-h-screen bg-slate-950 text-white p-6">
@@ -994,7 +1230,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                             value={currentTrack.id} 
                                             onChange={(e) => {
                                                 const track = musicLibrary.find(t => t.id === e.target.value);
-                                                if(track) setCurrentTrack(track);
+                                                if(track) pickTrack(track);
                                             }}
                                             className="bg-transparent text-xs font-bold w-32 outline-none cursor-pointer"
                                         >
@@ -1003,10 +1239,10 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                             ))}
                                         </select>
                                         <div className="flex items-center gap-2 mt-1">
-                                            <button onClick={() => setIsLooping(!isLooping)} className={`${isLooping ? 'text-green-400' : 'text-slate-500'} hover:text-white`} title="Loop">
+                                            <button onClick={() => setIsLooping(!isLooping)} className={`${isLooping ? 'text-green-400' : 'text-slate-500'} hover:text-white`} title="Loop current track">
                                                 <Repeat size={12} />
                                             </button>
-                                            <button onClick={() => setIsShuffling(!isShuffling)} className={`${isShuffling ? 'text-purple-400' : 'text-slate-500'} hover:text-white`} title="Shuffle">
+                                            <button onClick={() => setIsShuffling(!isShuffling)} className={`${isShuffling ? 'text-purple-400' : 'text-slate-500'} hover:text-white`} title="Shuffle (turn Loop off to use)">
                                                 <Shuffle size={12} />
                                             </button>
                                             <div className="h-3 w-[1px] bg-slate-600 mx-1"></div>
@@ -1068,10 +1304,10 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                         {gameState?.status === 'Lobby' ? (
                                             <div className="space-y-4">
                                                 <h3 className="font-bold text-cyan-400 border-b border-slate-700 pb-2">Mission Settings</h3>
-                                                <div className="flex justify-between items-center"><span>Imposters:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.imposterCount} onChange={e=>setConfig({...config, imposterCount:parseInt(e.target.value)})} /></div>
-                                                <div className="flex justify-between items-center"><span>Inv. Ratio:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.invRatio} onChange={e=>setConfig({...config, invRatio:parseInt(e.target.value)})} /></div>
-                                                <div className="flex justify-between items-center"><span>Remove Amt:</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.removeAmount} onChange={e=>setConfig({...config, removeAmount:parseInt(e.target.value)})} /></div>
-                                                <div className="flex justify-between items-center"><span>Meeting CD (s):</span><input type="number" className="w-16 bg-slate-800 p-1 rounded" value={config.meetingCooldown} onChange={e=>setConfig({...config, meetingCooldown:parseInt(e.target.value)})} /></div>
+                                                <div className="flex justify-between items-center"><span>Imposters:</span><NumField value={config.imposterCount} onChange={v => setConfig({...config, imposterCount: v})} /></div>
+                                                <div className="flex justify-between items-center"><span>Inv. Ratio:</span><NumField value={config.invRatio} onChange={v => setConfig({...config, invRatio: v})} /></div>
+                                                <div className="flex justify-between items-center"><span>Remove Amt:</span><NumField value={config.removeAmount} onChange={v => setConfig({...config, removeAmount: v})} /></div>
+                                                <div className="flex justify-between items-center"><span>Meeting CD (s):</span><NumField value={config.meetingCooldown} onChange={v => setConfig({...config, meetingCooldown: v})} /></div>
                                                 
                                                 <div className="grid grid-cols-2 gap-2 mt-2">
                                                     <button onClick={() => setShowCostEditor(true)} className="py-2 bg-slate-700 hover:bg-slate-600 rounded font-bold text-xs flex justify-center items-center gap-1">
@@ -1097,6 +1333,12 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                                     <div className="text-xs text-slate-400 uppercase">Investigations Left</div>
                                                     <div className="text-3xl font-mono text-cyan-400">{gameState?.config?.investigationsLeft}</div>
                                                 </div>
+                                                {gameState?.phase === 'Meeting' && (
+                                                    <div className="p-3 bg-slate-800 rounded border border-red-500/30 text-sm">
+                                                        <span className="text-slate-400 uppercase text-xs">Skip votes: </span>
+                                                        <span className="font-mono font-bold text-white">{gameState?.skipVotes || 0}</span>
+                                                    </div>
+                                                )}
                                                 <button onClick={() => setShowStats(true)} className="w-full py-2 bg-orange-700 hover:bg-orange-600 rounded font-bold">Reset to Lobby</button>
                                             </div>
                                         )}
@@ -1123,8 +1365,9 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
 
                                 <div className="lg:col-span-2 bg-slate-900 p-6 rounded-xl border border-slate-800">
                                     <div className="flex justify-between items-center mb-4">
-                                        <h2 className="text-2xl font-bold">Crew Manifest ({Object.keys(players).length})</h2>
+                                        <h2 className="text-2xl font-bold">Crew Manifest ({Object.keys(players).length}) <span className="text-sm font-normal text-slate-400">· {Object.keys(players).filter(isPresent).length} online</span></h2>
                                         <div className="flex gap-2">
+                                            <button onClick={removeAbsent} className="bg-slate-800 border border-slate-600 text-slate-200 px-3 py-2 rounded font-bold text-xs hover:bg-slate-700 transition-colors">Remove Absent</button>
                                             <button onClick={removeAllPlayers} className="bg-red-950 border border-red-800 text-red-200 px-3 py-2 rounded font-bold text-xs hover:bg-red-900 transition-colors">Remove All Crew</button>
                                             {gameState?.phase === 'Meeting' && <button onClick={endMeeting} className="bg-red-600 px-4 py-2 rounded font-bold animate-pulse">Force End Vote</button>}
                                         </div>
@@ -1136,9 +1379,10 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                                     <div className="font-bold flex items-center gap-2">
                                                         {p.isAlive?<Users size={16} className="text-cyan-400"/>:<Skull size={16} className="text-red-500"/>}
                                                         {p.name}
+                                                        <span title={isPresent(p.id) ? 'Online' : 'Not seen recently'} className={`inline-block w-2 h-2 rounded-full ${isPresent(p.id) ? 'bg-green-500' : 'bg-slate-600'}`}></span>
                                                         {gameState?.status !== 'Lobby' && <span className={`text-[10px] px-1 rounded ${p.role==='Imposter'?'bg-red-600':'bg-cyan-600'}`}>{p.role}</span>}
                                                     </div>
-                                                    <div className="text-xs text-slate-400">⚡ {p.energy} | ✓ {p.correct} | Votes: {p.votes || 0}</div>
+                                                    <div className="text-xs text-slate-400">⚡ {stats[p.id]?.energy ?? 0} | ✓ {stats[p.id]?.correct ?? 0} | Votes: {p.votes || 0}</div>
                                                 </div>
                                                 <button onClick={() => removePlayer(p.id)} className="text-slate-500 hover:text-red-500"><Trash2 size={16}/></button>
                                             </div>
@@ -1163,7 +1407,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                             <input value={uploadName} onChange={e=>setUploadName(e.target.value)} placeholder="Track Name" className="w-full p-2 bg-slate-800 rounded border border-slate-600 text-sm" />
                                             <div className="grid grid-cols-2 gap-2">
                                                 <div>
-                                                    <label className="block text-[10px] text-slate-500 mb-1">UPLOAD FILE (Max 900KB)</label>
+                                                    <label className="block text-[10px] text-slate-500 mb-1">UPLOAD FILE (Max 700KB)</label>
                                                     <input type="file" accept=".mp3,.wav" ref={fileInputRefMusic} onChange={handleMusicUpload} className="block w-full text-xs text-slate-400 file:mr-2 file:py-1 file:px-2 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-cyan-600 file:text-white hover:file:bg-cyan-500"/>
                                                 </div>
                                                 <div>
@@ -1181,7 +1425,13 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                         {musicLibrary.map(t => (
                                             <div key={t.id} className={`flex justify-between items-center p-3 rounded border ${t.id === currentTrack.id ? 'bg-cyan-900/30 border-cyan-500' : 'bg-slate-700 border-slate-600'}`}>
                                                 <div className="flex items-center gap-2 overflow-hidden">
-                                                    <button onClick={() => setCurrentTrack(t)} className="p-2 bg-slate-800 rounded-full hover:bg-slate-600">
+                                                    <button
+                                                        onClick={() => {
+                                                            if (t.id === currentTrack.id) setIsPlaying(p => !p);
+                                                            else { pickTrack(t); setIsPlaying(true); }
+                                                        }}
+                                                        className="p-2 bg-slate-800 rounded-full hover:bg-slate-600"
+                                                    >
                                                         {t.id === currentTrack.id && isPlaying ? <Pause size={12}/> : <Play size={12}/>}
                                                     </button>
                                                     <div className="truncate">
@@ -1356,8 +1606,8 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
                                             <div key={p.id} className="flex justify-between bg-slate-700 p-3 rounded">
                                                 <span>{p.name}</span>
                                                 <div className="flex gap-4">
-                                                    <span className="text-green-400">Correct: {p.correct}</span>
-                                                    <span className="text-red-400">Wrong: {p.incorrect}</span>
+                                                    <span className="text-green-400">Correct: {stats[p.id]?.correct ?? 0}</span>
+                                                    <span className="text-red-400">Wrong: {stats[p.id]?.incorrect ?? 0}</span>
                                                 </div>
                                             </div>
                                         ))}
@@ -1385,6 +1635,21 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             const [notes, setNotes] = useState("");
             
             const hasLoadedOnce = useRef(false);
+            const prevStatusRef = useRef(null);
+
+            // COST FIX: own counters come from the stats doc; answers are tallied locally and flushed in bulk
+            const [myStats, setMyStats] = useState(null);
+            const [playersReady, setPlayersReady] = useState(false);
+            const pendingRef = useRef({ energy: 0, correct: 0, incorrect: 0 });
+            const [pendingEnergy, setPendingEnergy] = useState(0); // display only
+            const noteOpenRef = useRef(false);
+            const removedRef = useRef(false); // set if the teacher removed us; stops heartbeats/flushes
+            noteOpenRef.current = noteOpen;
+
+            // FIX #10: estimate (server time - device time) so cooldowns don't depend on the device clock.
+            const [serverOffset, setServerOffset] = useState(0);
+            const offsetSetRef = useRef(false);
+            const nonceRef = useRef(Math.random().toString(36).slice(2));
             
             // Question Engine State
             const [qIndex, setQIndex] = useState(0);
@@ -1399,67 +1664,166 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)`;
             // Paths specific to the selected class
             const paths = useMemo(() => getPaths(classId), [classId]);
 
-useEffect(() => {
-    const init = async () => {
-        const ref = getPlayerRef(db, paths, pId);
-        const s = await getDoc(ref);
-        
-        // FIX #2: Check Game Status for Late Joiners
-        let initialRole = 'Pending';
-        if (!s.exists()) {
-            // Fetch game state once to check if active
-            const gameSnap = await getDoc(getGameRef(db, paths));
-            if (gameSnap.exists() && gameSnap.data().status === 'Active') {
-                initialRole = 'Crewmate';
-            }
-            
-            await setDoc(ref, { 
-                name: userName, 
-                role: initialRole, // Used to be hardcoded 'Pending'
-                isAlive: true, 
-                energy: 0, 
-                notes: '',
-                investigatedStatus: 'Normal'
-            });
-        } else {
-            // Just update name if re-joining
-            await updateDoc(ref, { name: userName });
-        }
-    };
-    init();
+            useEffect(() => {
+                const init = async () => {
+                    try {
+                        const ref = getPlayerRef(db, paths, pId);
+                        const s = await getDoc(ref);
+                        
+                        if (!s.exists()) {
+                            // Late joiners during an active game become Crewmates
+                            const gameSnap = await getDoc(getGameRef(db, paths));
+                            const initialRole = (gameSnap.exists() && gameSnap.data().status === 'Active') ? 'Crewmate' : 'Pending';
+                            
+                            await setDoc(ref, { 
+                                name: userName, 
+                                role: initialRole,
+                                isAlive: true, votes: 0, hasVoted: false, investigatedStatus: 'Normal',
+                                joinNonce: nonceRef.current,
+                                lastSeen: serverTimestamp()
+                            });
+                        } else {
+                            // Re-joining: keep all game state, just refresh name + server-clock probe
+                            await updateDoc(ref, { name: userName, joinNonce: nonceRef.current, lastSeen: serverTimestamp() });
+                        }
 
+                        // Counters live in their own doc (also migrates legacy values from the player doc)
+                        const sRef = getStatsRef(db, paths, pId);
+                        const st = await getDoc(sRef);
+                        if (!st.exists()) {
+                            const old = s.exists() ? s.data() : {};
+                            await setDoc(sRef, {
+                                energy: old.energy || 0, correct: old.correct || 0,
+                                incorrect: old.incorrect || 0, notes: old.notes || '',
+                                lastSeen: serverTimestamp()
+                            });
+                        } else {
+                            await updateDoc(sRef, { lastSeen: serverTimestamp() });
+                        }
+                    } catch (e) { console.error("Join failed", e); }
+                };
+                init();
 
                 const unsubG = onSnapshot(getGameRef(db, paths), (s) => {
                     const data = s.data();
-                    if (data?.status === 'Active' && gameState?.status === 'Lobby') setShowIntro(true);
+                    if (data?.status === 'Active' && prevStatusRef.current === 'Lobby') setShowIntro(true);
+                    if (data?.status === 'Lobby') { pendingRef.current = { energy: 0, correct: 0, incorrect: 0 }; setPendingEnergy(0); }
+                    prevStatusRef.current = data?.status;
                     setGameState(data);
                 });
                 const unsubP = onSnapshot(getPlayerRef(db, paths, pId), (s) => {
                     if (s.exists()) {
                         hasLoadedOnce.current = true;
-                        setMe(s.data());
-                        if (s.data()?.notes) setNotes(s.data().notes);
+                        const d = s.data();
+                        setMe(d);
+
+                        // Only trust a lastSeen written by THIS session and confirmed by the server
+                        if (!offsetSetRef.current && d.joinNonce === nonceRef.current && d.lastSeen?.seconds && !s.metadata.hasPendingWrites) {
+                            offsetSetRef.current = true;
+                            setServerOffset(d.lastSeen.seconds * 1000 - Date.now());
+                        }
                     } else {
                         if (hasLoadedOnce.current) {
+                            removedRef.current = true;
                             alert("You have been removed from the mission.");
                             window.location.reload();
                         }
                     }
                 });
-                const unsubAll = onSnapshot(collection(db, ...paths.games, GAME_ID, 'players'), (s) => {
-                    const all = {}; s.forEach(d => all[d.id] = {id: d.id, ...d.data()}); setPlayers(all);
+                const unsubS = onSnapshot(getStatsRef(db, paths, pId), (s) => {
+                    if (!s.exists()) return;
+                    const d = s.data();
+                    setMyStats(d);
+                    // Don't clobber text the student is typing
+                    if (!noteOpenRef.current) setNotes(d.notes || '');
                 });
-                return () => { unsubG(); unsubP(); unsubAll(); };
-            }, [gameState?.status, paths]);
+                return () => { unsubG(); unsubP(); unsubS(); };
+            }, [paths, pId]);
+
+            // --- COST FIX: debounced stat writes ---
+            const flushPending = async () => {
+                if (removedRef.current) return;
+                const p = pendingRef.current;
+                if (!p.energy && !p.correct && !p.incorrect) return;
+                pendingRef.current = { energy: 0, correct: 0, incorrect: 0 };
+                setPendingEnergy(0);
+                try {
+                    await setDoc(getStatsRef(db, paths, pId), {
+                        energy: increment(p.energy), correct: increment(p.correct), incorrect: increment(p.incorrect),
+                        lastSeen: serverTimestamp()
+                    }, { merge: true });
+                } catch (e) {
+                    console.error("Stat sync failed, will retry", e);
+                    const q = pendingRef.current;
+                    pendingRef.current = { energy: q.energy + p.energy, correct: q.correct + p.correct, incorrect: q.incorrect + p.incorrect };
+                    setPendingEnergy(pendingRef.current.energy);
+                }
+            };
+            const flushRef = useRef(flushPending);
+            flushRef.current = flushPending;
+
+            useEffect(() => {
+                const id = setInterval(() => flushRef.current(), 5000);
+
+                // Heartbeat: lets the teacher tell who is actually here (only while the tab is visible)
+                const beat = () => {
+                    if (removedRef.current || document.visibilityState !== 'visible') return;
+                    setDoc(getStatsRef(db, paths, pId), { lastSeen: serverTimestamp() }, { merge: true }).catch(() => {});
+                };
+                const beatId = setInterval(beat, HEARTBEAT_MS);
+
+                const onHide = () => { if (document.visibilityState === 'hidden') flushRef.current(); else beat(); };
+                const onLeave = () => flushRef.current();
+                document.addEventListener('visibilitychange', onHide);
+                window.addEventListener('pagehide', onLeave);
+                window.addEventListener('beforeunload', onLeave);
+                return () => {
+                    clearInterval(id);
+                    clearInterval(beatId);
+                    document.removeEventListener('visibilitychange', onHide);
+                    window.removeEventListener('pagehide', onLeave);
+                    window.removeEventListener('beforeunload', onLeave);
+                    flushRef.current();
+                };
+            }, []);
+
+            // --- COST FIX: the players collection is only read when a screen needs it ---
+            // Lobby: live (so join chips update). Meeting / Mission Control / Win screen: one-time fetch,
+            // since names and alive-status don't change while those screens are open.
+            const needLive = gameState?.status === 'Lobby';
+            const needFetch = !needLive && !!gameState && (gameState.phase === 'Meeting' || menuOpen || !!gameState.winner);
+
+            useEffect(() => {
+                if (!needLive) return;
+                const unsub = onSnapshot(collection(db, ...paths.games, GAME_ID, 'players'), (s) => {
+                    const all = {}; s.forEach(d => all[d.id] = {id: d.id, ...d.data()});
+                    setPlayers(all);
+                    setPlayersReady(true);
+                });
+                return () => { unsub(); setPlayersReady(false); };
+            }, [needLive, paths]);
+
+            useEffect(() => {
+                if (!needFetch) return;
+                let cancelled = false;
+                getDocs(collection(db, ...paths.games, GAME_ID, 'players')).then((s) => {
+                    if (cancelled) return;
+                    const all = {}; s.forEach(d => all[d.id] = {id: d.id, ...d.data()});
+                    setPlayers(all);
+                    setPlayersReady(true);
+                }).catch(e => console.error("Could not load crew list", e));
+                return () => { cancelled = true; setPlayersReady(false); };
+            }, [needFetch, paths]);
 
             // --- Question Randomization Logic ---
+            const questionsKey = JSON.stringify(gameState?.questions);
 
             // 1. Reset Queue if Teacher loads a completely new Question Set
             useEffect(() => {
                 setQuestionQueue([]);
                 setQIndex(0);
                 setFeedback(null);
-            }, [JSON.stringify(gameState?.questions)]); 
+            }, [questionsKey]); 
 
             // 2. Queue Management (Refill with shuffled indices when running low)
             useEffect(() => {
@@ -1477,11 +1841,12 @@ useEffect(() => {
             }, [qIndex, questionQueue.length, gameState]);
 
             // 3. Derive Current Question Data (Random Q + Scrambled Answers)
+            // Depends on the raw index (not the whole queue) so a queue refill doesn't re-scramble the question on screen.
+            const rawIndex = questionQueue[qIndex];
             const currentQData = useMemo(() => {
                 if (!gameState) return null;
                 const qs = gameState.questions || DEFAULT_QUESTIONS;
                 
-                const rawIndex = questionQueue[qIndex];
                 if (rawIndex === undefined) return null;
                 
                 const safeQ = qs[rawIndex] || qs[0];
@@ -1493,27 +1858,24 @@ useEffect(() => {
                 }
 
                 return { 
-					q: safeQ.q, 
-					shuffledOptions: options, 
-					rawCorrectIndex: safeQ.correct 
-				};
-				// We use JSON.stringify so it only updates if the actual CONTENT of questions changes, not just the database reference
-			}, [qIndex, JSON.stringify(gameState?.questions), questionQueue]);
+                    q: safeQ.q, 
+                    shuffledOptions: options, 
+                    rawCorrectIndex: safeQ.correct 
+                };
+            }, [qIndex, rawIndex, questionsKey]);
 
             const handleAns = async (selectedOption) => {
                 if (!currentQData || feedback) return;
                 const correct = selectedOption.originalIndex === currentQData.rawCorrectIndex;
                 
-                const batch = writeBatch(db);
-                const pRef = getPlayerRef(db, paths, pId);
-                
-                if (correct) {
-                    batch.update(pRef, { energy: increment(1), correct: increment(1) });
-                } else {
-                    if (me.energy > 0) batch.update(pRef, { energy: increment(-1) });
-                    batch.update(pRef, { incorrect: increment(1) });
+                // Tally locally; flushPending() syncs every few seconds and before any spend
+                const p = pendingRef.current;
+                if (correct) { p.energy += 1; p.correct += 1; }
+                else {
+                    if ((myStats?.energy || 0) + p.energy > 0) p.energy -= 1;
+                    p.incorrect += 1;
                 }
-                await batch.commit();
+                setPendingEnergy(p.energy);
 
                 setFeedback({
                     isCorrect: correct,
@@ -1534,15 +1896,23 @@ useEffect(() => {
                 setFeedback(null);
             };
 
+            // FIX #1: 'skip' is tallied on the game doc (there is no player doc called 'skip')
             const voteFor = async (targetId) => {
                 if (me.hasVoted || !me.isAlive) return;
-                const batch = writeBatch(db);
-                batch.update(getPlayerRef(db, paths, pId), { hasVoted: true });
-                batch.update(getPlayerRef(db, paths, targetId), { votes: increment(1) });
-                await batch.commit();
+                try {
+                    const batch = writeBatch(db);
+                    batch.update(getPlayerRef(db, paths, pId), { hasVoted: true });
+                    if (targetId === 'skip') batch.update(getGameRef(db, paths), { skipVotes: increment(1) });
+                    else batch.update(getPlayerRef(db, paths, targetId), { votes: increment(1) });
+                    await batch.commit();
+                } catch (e) {
+                    alert("Vote failed, please try again: " + e.message);
+                }
             };
 
             if (!gameState || !me) return <div className="min-h-screen bg-slate-900 text-white p-10">Syncing...</div>;
+
+            const displayEnergy = (myStats?.energy || 0) + pendingEnergy;
 
             // Win Screens
             if (gameState.winner) return <WinScreen winner={gameState.winner} players={players} />;
@@ -1567,7 +1937,10 @@ useEffect(() => {
                         <h1 className="text-2xl font-bold text-red-500 uppercase">Emergency Meeting</h1>
                         <p className="text-slate-400">{me.isAlive ? (me.hasVoted ? "Vote Cast. Waiting..." : "Vote for an Imposter") : "You are dead."}</p>
                     </div>
-                    {me.isAlive && !me.hasVoted && (
+                    {me.isAlive && !me.hasVoted && !playersReady && (
+                        <p className="text-center text-slate-500 animate-pulse">Loading crew list...</p>
+                    )}
+                    {me.isAlive && !me.hasVoted && playersReady && (
                         <div className="grid grid-cols-2 gap-3">
                             {Object.values(players).filter(p => p.isAlive && p.id !== pId).map(p => (
                                 <button key={p.id} onClick={() => voteFor(p.id)} className="p-4 bg-slate-800 border border-slate-600 rounded-xl font-bold hover:bg-red-900 hover:border-red-500 transition-all">
@@ -1587,7 +1960,7 @@ useEffect(() => {
                         <div className="w-8"></div> 
                         <button onClick={() => setNoteOpen(true)} className="bg-slate-700 p-2 rounded relative">
                             <FileText size={20} />
-                            {me.notes && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
+                            {myStats?.notes && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
                         </button>
                     </div>
 
@@ -1617,7 +1990,7 @@ useEffect(() => {
                                             
                                             if (feedback) {
                                                 const isThisCorrect = opt.originalIndex === feedback.correctOriginalIndex;
-                                                const isThisSelected = opt.text === feedback.selectedOption.text;
+                                                const isThisSelected = opt.originalIndex === feedback.selectedOption.originalIndex;
                                                 
                                                 if (isThisCorrect) {
                                                     btnClass = "p-4 rounded-xl font-bold text-left text-white bg-slate-800 border-4 border-green-500 shadow-[0_0_15px_rgba(34,197,94,0.5)]";
@@ -1650,31 +2023,29 @@ useEffect(() => {
                     <div className="bg-slate-800 p-4 flex justify-between items-center border-t border-slate-700 relative z-20">
                         <div>
                             <span className="text-[10px] uppercase text-slate-400 tracking-widest">Energy</span>
-                            <div className="text-3xl font-mono font-bold text-yellow-400 flex items-center gap-1"><Zap fill="currentColor"/> {me.energy}</div>
+                            <div className="text-3xl font-mono font-bold text-yellow-400 flex items-center gap-1"><Zap fill="currentColor"/> {displayEnergy}</div>
                         </div>
-<button onClick={() => setMenuOpen(true)} className="bg-slate-700 hover:bg-slate-600 px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg">
-                        <Settings size={20} /> Mission Control
-                    </button>
-                </div>
+                        <button onClick={() => setMenuOpen(true)} className="bg-slate-700 hover:bg-slate-600 px-6 py-3 rounded-xl font-bold flex items-center gap-2 shadow-lg">
+                            <Settings size={20} /> Mission Control
+                        </button>
+                    </div>
 
-                {menuOpen && <MissionControl 
-                    role={me.role} 
-                    energy={me.energy} 
-                    me={me} 
-                    pId={pId} 
-                    players={players} 
-                    config={gameState.config} 
-                    gameState={gameState} 
-                    db={db} 
-                    classId={classId}
-                    close={() => setMenuOpen(false)} 
-                    setNote={setViewingNote} 
-                />}
-                
-                {noteOpen && (
+                    {menuOpen && <MissionControl 
+                        role={me.role} energy={displayEnergy} me={me} 
+                        pId={pId} 
+                        players={players} 
+                        config={gameState.config} 
+                        gameState={gameState} 
+                        db={db} 
+                        classId={classId}
+                        serverOffset={serverOffset} flushPending={flushPending} playersReady={playersReady} close={() => setMenuOpen(false)} 
+                        setNote={setViewingNote} 
+                    />}
+                    
+                    {noteOpen && (
                         <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 z-50">
                             <div className="bg-slate-800 w-full max-w-lg rounded-xl p-6">
-                                <div className="flex justify-between mb-4"><h2 className="font-bold flex gap-2"><FileText/> Log</h2><button onClick={()=>{updateDoc(getPlayerRef(db, paths, pId), {notes}); setNoteOpen(false)}}><XCircle/></button></div>
+                                <div className="flex justify-between mb-4"><h2 className="font-bold flex gap-2"><FileText/> Log</h2><button onClick={()=>{setDoc(getStatsRef(db, paths, pId), {notes}, {merge: true}); setNoteOpen(false)}}><XCircle/></button></div>
                                 <textarea value={notes} onChange={e=>setNotes(e.target.value)} className="w-full h-40 bg-slate-900 rounded p-3 text-white" placeholder="Suspicions..." />
                             </div>
                         </div>
@@ -1694,260 +2065,316 @@ useEffect(() => {
         }
 
         // --- Mission Control ---
-function MissionControl({ role, energy, me, pId, players, config, gameState, db, classId, close, setNote }) {
-    const [msg, setMsg] = useState("");
-    const [mode, setMode] = useState(null); 
-    
-    // Generate paths
-    const paths = useMemo(() => getPaths(classId), [classId]);
-
-    // Helper: Deduct energy
-    const pay = async (amount) => {
-        if (me.energy < amount) {
-            setMsg("Not enough energy!");
-            setTimeout(() => setMsg(""), 2000);
-            return false;
-        }
-        const pRef = getPlayerRef(db, paths, pId);
-        await updateDoc(pRef, { energy: increment(-amount) });
-        return true;
-    };
-
-    // --- FIX #4: NEW INVESTIGATION LOGIC ---
-    const getInvestigationResult = (target) => {
-        const isDisguised = target.investigatedStatus === 'Disguised';
-        const isSabotaged = target.investigatedStatus === 'Unclear';
-        const isImposter = target.role === 'Imposter';
-        const rng = Math.random(); // 0.0 to 1.0
-
-        // 1. Disguise overrides everything (Imposter looks innocent)
-        if (isDisguised) return "All Clear";
-
-        // 2. Sabotage overrides remaining logic (Crew looks suspicious)
-        if (isSabotaged) return "Inconclusive";
-
-        // 3. 33% Global Chance of "Inconclusive" for anyone
-        if (rng < 0.33) return "Inconclusive";
-
-        // 4. Role based results
-        if (isImposter) return "Inconclusive";
-        
-        // 5. Default Crewmate
-        return "All Clear";
-    };
-
-    // --- ACTION HANDLER ---
-    const handleTargetAction = async (targetId) => {
-        const target = players[targetId];
-        if (!target) return;
-
-        if (mode === 'peek') {
-            if (!(await pay(config.costs.peek))) return;
-            setNote(target.notes || "This notebook is empty.");
-            close();
-        }
-        else if (mode === 'private') {
-            if (!(await pay(config.costs.private))) return;
+        function MissionControl({ role, energy, me, pId, players, config, gameState, db, classId, serverOffset, flushPending, playersReady, close, setNote }) {
+            const [msg, setMsg] = useState("");
+            const [mode, setMode] = useState(null); 
             
-            // Logic: New RNG system
-            const result = getInvestigationResult(target);
+            // Generate paths
+            const paths = useMemo(() => getPaths(classId), [classId]);
 
-            // Reset target status after check
-            if (target.investigatedStatus !== 'Normal') {
-                await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
-            }
+            const flash = (text, ms = 2000) => {
+                setMsg(text);
+                setTimeout(() => setMsg(""), ms);
+            };
 
-            alert(`INVESTIGATION RESULT:\n\nSubject: ${target.name}\nResult: ${result}`);
-            close();
-        }
-        else if (mode === 'public') {
-            if (!(await pay(config.costs.public))) return;
+            // Atomic energy payment (FIX #9/#10: no more double-tap overspend).
+            // invDelta !== 0 also adjusts the shared investigation pool in the same transaction,
+            // refusing (and not charging) when the pool is already empty. The pool never goes below 0.
+            const spend = async (cost, invDelta = 0) => {
+                await flushPending(); // make sure locally-tallied energy is on the server first
+                const pRef = getStatsRef(db, paths, pId); // energy lives in the stats doc
+                const gRef = getGameRef(db, paths);
+                try {
+                    const result = await runTransaction(db, async (tx) => {
+                        const ps = await tx.get(pRef);
+                        const gs = invDelta !== 0 ? await tx.get(gRef) : null;
 
-            const result = getInvestigationResult(target);
+                        const cur = ps.exists() ? (ps.data().energy || 0) : 0;
+                        if (cur < cost) return 'energy';
 
-            if (target.investigatedStatus !== 'Normal') {
-                await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
-            }
+                        if (invDelta !== 0) {
+                            const left = gs.data()?.config?.investigationsLeft ?? 0;
+                            if (left <= 0) return 'empty';
+                            tx.update(gRef, { 'config.investigationsLeft': Math.max(0, left + invDelta) });
+                        }
+                        tx.set(pRef, { energy: cur - cost }, { merge: true });
+                        return 'ok';
+                    });
 
-            // Post to feed
-            await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                message: `${me.name} investigated ${target.name}. Result: ${result}`,
-                source: "Investigation Terminal",
-                timestamp: serverTimestamp()
-            });
-            
-            await updateDoc(getGameRef(db, paths), { 
-                'config.investigationsLeft': increment(-1) 
-            });
+                    if (result === 'energy') { flash("Not enough energy!"); return false; }
+                    if (result === 'empty') { flash("No investigations left!"); return false; }
+                    return true;
+                } catch (e) {
+                    flash("Error: " + e.message, 3000);
+                    return false;
+                }
+            };
 
-            close();
-        }
-        else if (mode === 'unclear') {
-             if (!(await pay(config.costs.unclear))) return;
-             await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Unclear' });
-             setMsg(`Sabotaged ${target.name}'s ID!`);
-             setTimeout(close, 1000);
-        }
-        // --- FIX #3: FAKE INVESTIGATION LOGIC ---
-        else if (mode === 'fake') {
-            if (!(await pay(config.costs.fake))) return;
-            
-            await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
-                message: `${me.name} investigated ${target.name}. Result: All Clear`, // Always fake clear
-                source: "Investigation Terminal",
-                timestamp: serverTimestamp()
-            });
-            
-            setMsg("Fake log generated.");
-            setTimeout(close, 1000);
-        }
-    };
+            // --- INVESTIGATION LOGIC ---
+            const getInvestigationResult = (target) => {
+                const isDisguised = target.investigatedStatus === 'Disguised';
+                const isSabotaged = target.investigatedStatus === 'Unclear';
+                const isImposter = target.role === 'Imposter';
+                const rng = Math.random(); // 0.0 to 1.0
 
-    const triggerMeeting = async () => {
-        // Cooldown check
-        const now = new Date().getTime() / 1000;
-        const lastEnd = gameState.lastMeetingEnded ? gameState.lastMeetingEnded.seconds : 0;
-        const cooldown = config.meetingCooldown || 120;
-        
-        if (now - lastEnd < cooldown) {
-            setMsg(`Systems cooling down... Wait ${Math.ceil(cooldown - (now - lastEnd))}s`);
-            setTimeout(() => setMsg(""), 3000);
-            return;
-        }
+                // 1. Disguise overrides everything (Imposter looks innocent)
+                if (isDisguised) return "All Clear";
 
-        if (!(await pay(config.costs.emergency))) return;
+                // 2. Sabotage overrides remaining logic (Crew looks suspicious)
+                if (isSabotaged) return "Inconclusive";
 
-        const batch = writeBatch(db);
-        batch.update(getGameRef(db, paths), { phase: 'Meeting' });
-        batch.set(doc(collection(db, ...paths.games, GAME_ID, 'feed')), {
-            message: `🚨 EMERGENCY MEETING CALLED BY ${me.name.toUpperCase()}!`,
-            source: "System Alert",
-            timestamp: serverTimestamp()
-        });
-        await batch.commit();
-        close();
-    };
+                // 3. 33% Global Chance of "Inconclusive" for anyone
+                if (rng < 0.33) return "Inconclusive";
 
-    // --- FIX #1: GHOST ACTIONS ---
-    const donateEnergy = async (targetRole) => {
-        // Transfer all current energy (or fixed amount) to a random alive player of that role
-        if (me.energy < 1) {
-            setMsg("Need energy to donate!"); 
-            return;
-        }
-
-        const potentialTargets = Object.values(players).filter(p => 
-            p.isAlive && p.role === targetRole && p.id !== pId
-        );
-
-        if (potentialTargets.length === 0) {
-            setMsg("No alive teammates found!");
-            return;
-        }
-
-        const recipient = potentialTargets[Math.floor(Math.random() * potentialTargets.length)];
-        const amount = me.energy; // Donate ALL energy
-
-        const batch = writeBatch(db);
-        batch.update(getPlayerRef(db, paths, pId), { energy: 0 }); // Drain Ghost
-        batch.update(getPlayerRef(db, paths, recipient.id), { energy: increment(amount) }); // Give to teammate
-        
-        await batch.commit();
-        setMsg(`Donated ${amount}⚡ to ${recipient.name}`);
-        setTimeout(close, 1500);
-    };
-
-    // IMPOSTER ACTIONS (Instant)
-    const doRemove = async () => {
-        if (!(await pay(config.costs.remove))) return;
-        await updateDoc(getGameRef(db, paths), { 'config.investigationsLeft': increment(-config.removeAmount) });
-        setMsg("Records deleted...");
-        setTimeout(close, 1000);
-    };
-
-    const doDisguise = async () => {
-        if (!(await pay(config.costs.disguise))) return;
-        await updateDoc(getPlayerRef(db, paths, pId), { investigatedStatus: 'Disguised' });
-        setMsg("Disguise active (1 Use)");
-        setTimeout(close, 1000);
-    };
-
-    return (
-        <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
-            <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim max-h-[90vh] flex flex-col">
-                <div className="flex justify-between items-center mb-6">
-                    <h2 className="text-2xl font-black uppercase text-cyan-400">
-                        {mode ? <button onClick={() => setMode(null)} className="text-sm mr-2 text-slate-400 hover:text-white">← BACK</button> : null}
-                        Mission Control
-                    </h2>
-                    <button onClick={close}><XCircle /></button>
-                </div>
+                // 4. Role based results
+                if (isImposter) return "Inconclusive";
                 
-                {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded animate-pulse">{msg}</div>}
-                
-                {/* MODE: MAIN MENU */}
-                {!mode && (
-                    <div className="grid grid-cols-2 gap-3 overflow-y-auto">
-                        {/* FIX #1: GHOST MENU */}
-                        {!me.isAlive ? (
-                            <>
-                                <div className="col-span-2 text-center text-slate-500 italic mb-2">Ghost Uplink Established</div>
-                                <ActionBtn icon={Zap} title="Donate to Crew" desc="Send energy to alive Crew." cost="ALL" fullDesc="Transfers all your collected energy to a random Crewmate." onClick={() => donateEnergy('Crewmate')} color="cyan" />
-                                <ActionBtn icon={Zap} title="Donate to Imposter" desc="Send energy to alive Imposters." cost="ALL" fullDesc="Transfers all your collected energy to a random Imposter." onClick={() => donateEnergy('Imposter')} color="red" />
-                            </>
-                        ) : (
-                            /* ALIVE PLAYERS MENU */
-                            role === 'Crewmate' ? (
-                                <>
-                                    <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
-                                    <ActionBtn icon={Lock} title="Private Inv." desc="Investigate privately." cost={config.costs.private} fullDesc="Check if a player is 'All Clear' or 'Inconclusive'. Only you see the result." onClick={() => setMode('private')} />
-                                    <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & Broadcast." cost={config.costs.public} fullDesc="Check a player and post the result to the Public Feed." onClick={() => setMode('public')} />
-                                    <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={triggerMeeting} color="red" />
-                                </>
-                            ) : (
-                                <>
-                                    <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool.`} onClick={doRemove} />
-                                    {/* FIX #3: FAKE INVESTIGATE IS NOW A SELECTION MODE */}
-                                    <ActionBtn icon={FileText} title="Fake Inv." desc="Create fake public log." cost={config.costs.fake} fullDesc="Select a player to generate a fake 'All Clear' report on the public feed." onClick={() => setMode('fake')} />
-                                    <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear'." onClick={() => setMode('unclear')} />
-                                    <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={doDisguise} />
-                                </>
-                            )
+                // 5. Default Crewmate
+                return "All Clear";
+            };
+
+            // --- ACTION HANDLER ---
+            const handleTargetAction = async (targetId) => {
+                const target = players[targetId];
+                if (!target) return;
+
+                if (mode === 'peek') {
+                    if (!(await spend(config.costs.peek))) return;
+                    // Notes live in the target's stats doc; fetch just that one doc on demand
+                    let noteText = "This notebook is empty.";
+                    try {
+                        const ns = await getDoc(getStatsRef(db, paths, targetId));
+                        noteText = ns.data()?.notes || noteText;
+                    } catch (e) { console.error(e); }
+                    setNote(noteText);
+                    close();
+                }
+                else if (mode === 'private') {
+                    if (!(await spend(config.costs.private))) return;
+                    
+                    const result = getInvestigationResult(target);
+
+                    // Reset target status after check
+                    if (target.investigatedStatus !== 'Normal') {
+                        await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
+                    }
+
+                    alert(`INVESTIGATION RESULT:\n\nSubject: ${target.name}\nResult: ${result}`);
+                    close();
+                }
+                else if (mode === 'public') {
+                    // FIX #9: pays and consumes one investigation atomically; refuses when none are left
+                    if (!(await spend(config.costs.public, -1))) return;
+
+                    const result = getInvestigationResult(target);
+
+                    if (target.investigatedStatus !== 'Normal') {
+                        await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Normal' });
+                    }
+
+                    await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                        message: `${me.name} investigated ${target.name}. Result: ${result}`,
+                        source: "Investigation Terminal",
+                        timestamp: serverTimestamp()
+                    });
+
+                    close();
+                }
+                else if (mode === 'unclear') {
+                     if (!(await spend(config.costs.unclear))) return;
+                     await updateDoc(getPlayerRef(db, paths, targetId), { investigatedStatus: 'Unclear' });
+                     setMsg(`Sabotaged ${target.name}'s ID!`);
+                     setTimeout(close, 1000);
+                }
+                else if (mode === 'fake') {
+                    if (!(await spend(config.costs.fake))) return;
+                    
+                    await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                        message: `${me.name} investigated ${target.name}. Result: All Clear`, // Always fake clear
+                        source: "Investigation Terminal",
+                        timestamp: serverTimestamp()
+                    });
+                    
+                    setMsg("Fake log generated.");
+                    setTimeout(close, 1000);
+                }
+            };
+
+            // FIX #10: only during normal play, cooldown measured on (approximate) server time,
+            // and the phase flip + energy charge happen in one transaction so two students
+            // can't both trigger a meeting.
+            const triggerMeeting = async () => {
+                if (gameState.winner || gameState.phase !== 'Game') {
+                    flash("A meeting can't be called right now.", 3000);
+                    return;
+                }
+
+                const serverNow = (Date.now() + (serverOffset || 0)) / 1000;
+                const lastEnd = gameState.lastMeetingEnded ? gameState.lastMeetingEnded.seconds : 0;
+                const cooldown = config.meetingCooldown ?? 120;
+                const remaining = cooldown - (serverNow - lastEnd);
+                if (lastEnd && remaining > 0) {
+                    flash(`Systems cooling down... Wait ${Math.ceil(remaining)}s`, 3000);
+                    return;
+                }
+
+                await flushPending();
+                const pRef = getStatsRef(db, paths, pId); // energy lives in the stats doc
+                const gRef = getGameRef(db, paths);
+                const feedDoc = doc(collection(db, ...paths.games, GAME_ID, 'feed'));
+                const cost = config.costs.emergency;
+
+                try {
+                    const result = await runTransaction(db, async (tx) => {
+                        const gs = await tx.get(gRef);
+                        const ps = await tx.get(pRef);
+                        const g = gs.data();
+                        if (!g || g.phase !== 'Game' || g.winner) return 'phase';
+                        const cur = ps.exists() ? (ps.data().energy || 0) : 0;
+                        if (cur < cost) return 'energy';
+
+                        tx.set(pRef, { energy: cur - cost }, { merge: true });
+                        tx.update(gRef, { phase: 'Meeting', skipVotes: 0 });
+                        tx.set(feedDoc, {
+                            message: `🚨 EMERGENCY MEETING CALLED BY ${me.name.toUpperCase()}!`,
+                            source: "System Alert",
+                            timestamp: serverTimestamp()
+                        });
+                        return 'ok';
+                    });
+
+                    if (result === 'energy') return flash("Not enough energy!");
+                    if (result === 'phase') return flash("A meeting can't be called right now.", 3000);
+                    close();
+                } catch (e) {
+                    flash("Error: " + e.message, 3000);
+                }
+            };
+
+            // --- GHOST ACTIONS ---
+            const donateEnergy = async (targetRole) => {
+                if (!playersReady) { flash("Scanning crew... try again in a second."); return; }
+
+                const potentialTargets = Object.values(players).filter(p => 
+                    p.isAlive && p.role === targetRole && p.id !== pId
+                );
+                if (potentialTargets.length === 0) {
+                    setMsg("No alive teammates found!");
+                    return;
+                }
+
+                await flushPending();
+                const recipient = potentialTargets[Math.floor(Math.random() * potentialTargets.length)];
+                const meRef = getStatsRef(db, paths, pId);
+                const recRef = getStatsRef(db, paths, recipient.id);
+
+                try {
+                    // Donate ALL energy, atomically
+                    const amount = await runTransaction(db, async (tx) => {
+                        const ms = await tx.get(meRef);
+                        const amt = ms.exists() ? (ms.data().energy || 0) : 0;
+                        if (amt < 1) return 0;
+                        tx.update(meRef, { energy: 0 });
+                        tx.set(recRef, { energy: increment(amt) }, { merge: true });
+                        return amt;
+                    });
+                    if (!amount) { setMsg("Need energy to donate!"); return; }
+                    setMsg(`Donated ${amount}⚡ to ${recipient.name}`);
+                    setTimeout(close, 1500);
+                } catch (e) {
+                    flash("Error: " + e.message, 3000);
+                }
+            };
+
+            // IMPOSTER ACTIONS (Instant)
+            const doRemove = async () => {
+                // FIX #9: clamps at 0 and won't charge if the pool is already empty
+                if (!(await spend(config.costs.remove, -config.removeAmount))) return;
+                setMsg("Records deleted...");
+                setTimeout(close, 1000);
+            };
+
+            const doDisguise = async () => {
+                if (!(await spend(config.costs.disguise))) return;
+                await updateDoc(getPlayerRef(db, paths, pId), { investigatedStatus: 'Disguised' });
+                setMsg("Disguise active (1 Use)");
+                setTimeout(close, 1000);
+            };
+
+            return (
+                <div className="fixed inset-0 bg-black/80 z-50 flex items-end sm:items-center justify-center sm:p-4">
+                    <div className="bg-slate-900 w-full max-w-lg sm:rounded-2xl border-t sm:border border-slate-700 p-6 slide-up-anim max-h-[90vh] flex flex-col">
+                        <div className="flex justify-between items-center mb-6">
+                            <h2 className="text-2xl font-black uppercase text-cyan-400">
+                                {mode ? <button onClick={() => setMode(null)} className="text-sm mr-2 text-slate-400 hover:text-white">← BACK</button> : null}
+                                Mission Control
+                            </h2>
+                            <button onClick={close}><XCircle /></button>
+                        </div>
+                        
+                        {msg && <div className="mb-4 p-2 bg-red-500 text-white text-center rounded animate-pulse">{msg}</div>}
+                        
+                        {/* MODE: MAIN MENU */}
+                        {!mode && (
+                            <div className="grid grid-cols-2 gap-3 overflow-y-auto">
+                                {!me.isAlive ? (
+                                    <>
+                                        <div className="col-span-2 text-center text-slate-500 italic mb-2">Ghost Uplink Established</div>
+                                        <ActionBtn icon={Zap} title="Donate to Crew" desc="Send energy to alive Crew." cost="ALL" fullDesc="Transfers all your collected energy to a random Crewmate." onClick={() => donateEnergy('Crewmate')} color="cyan" />
+                                        <ActionBtn icon={Zap} title="Donate to Imposter" desc="Send energy to alive Imposters." cost="ALL" fullDesc="Transfers all your collected energy to a random Imposter." onClick={() => donateEnergy('Imposter')} color="red" />
+                                    </>
+                                ) : (
+                                    /* ALIVE PLAYERS MENU */
+                                    role === 'Crewmate' ? (
+                                        <>
+                                            <ActionBtn icon={Eye} title="Note Peek" desc="Check a player's notes." cost={config.costs.peek} fullDesc="Select a player to read their notebook." onClick={() => setMode('peek')} />
+                                            <ActionBtn icon={Lock} title="Private Inv." desc="Investigate privately." cost={config.costs.private} fullDesc="Check if a player is 'All Clear' or 'Inconclusive'. Only you see the result." onClick={() => setMode('private')} />
+                                            <ActionBtn icon={Radio} title="Public Inv." desc="Investigate & Broadcast." cost={config.costs.public} fullDesc="Check a player and post the result to the Public Feed." onClick={() => setMode('public')} />
+                                            <ActionBtn icon={AlertTriangle} title="Emergency" desc="Call a meeting!" cost={config.costs.emergency} fullDesc="Stop the game to vote someone out." onClick={triggerMeeting} color="red" />
+                                        </>
+                                    ) : (
+                                        <>
+                                            <ActionBtn icon={UserX} title="Inv. Remover" desc="Remove crew investigations!" cost={config.costs.remove} fullDesc={`Remove ${config.removeAmount} investigations from the total pool.`} onClick={doRemove} />
+                                            <ActionBtn icon={FileText} title="Fake Inv." desc="Create fake public log." cost={config.costs.fake} fullDesc="Select a player to generate a fake 'All Clear' report on the public feed." onClick={() => setMode('fake')} />
+                                            <ActionBtn icon={Unlock} title="Unclear" desc="Make crew look guilty!" cost={config.costs.unclear} fullDesc="Target player will return 'Inconclusive' instead of 'All Clear'." onClick={() => setMode('unclear')} />
+                                            <ActionBtn icon={Shield} title="Disguise" desc="Look innocent once." cost={config.costs.disguise} fullDesc="You will show up as 'All Clear' the next time you are investigated." onClick={doDisguise} />
+                                        </>
+                                    )
+                                )}
+                            </div>
                         )}
-                    </div>
-                )}
 
-                {/* MODE: PLAYER SELECTION */}
-                {/* Added 'fake' to the list of modes that trigger selection */}
-                {mode && ['peek', 'private', 'public', 'unclear', 'fake'].includes(mode) && (
-                    <div className="flex-1 overflow-y-auto">
-                        <h3 className="text-slate-400 mb-2 uppercase text-xs font-bold">Select Target:</h3>
-                        <div className="space-y-2">
-                            {Object.values(players).filter(p => p.id !== pId && p.isAlive).map(p => (
-                                <button 
-                                    key={p.id} 
-                                    onClick={() => handleTargetAction(p.id)}
-                                    className="w-full text-left p-3 bg-slate-800 hover:bg-cyan-900 rounded border border-slate-700 flex justify-between items-center"
-                                >
-                                    <span className="font-bold">{p.name}</span>
-                                    <span className="text-xs text-slate-500">Select</span>
-                                </button>
-                            ))}
-                            {Object.values(players).filter(p => p.id !== pId && p.isAlive).length === 0 && (
-                                <div className="text-slate-500 italic text-center py-4">No viable targets found.</div>
-                            )}
+                        {/* MODE: PLAYER SELECTION */}
+                        {mode && ['peek', 'private', 'public', 'unclear', 'fake'].includes(mode) && (
+                            <div className="flex-1 overflow-y-auto">
+                                <h3 className="text-slate-400 mb-2 uppercase text-xs font-bold">Select Target:</h3>
+                                <div className="space-y-2">
+                                    {playersReady && Object.values(players).filter(p => p.id !== pId && p.isAlive).map(p => (
+                                        <button 
+                                            key={p.id} 
+                                            onClick={() => handleTargetAction(p.id)}
+                                            className="w-full text-left p-3 bg-slate-800 hover:bg-cyan-900 rounded border border-slate-700 flex justify-between items-center"
+                                        >
+                                            <span className="font-bold">{p.name}</span>
+                                            <span className="text-xs text-slate-500">Select</span>
+                                        </button>
+                                    ))}
+                                    {!playersReady && <div className="text-slate-500 italic text-center py-4 animate-pulse">Scanning crew...</div>}
+                                    {playersReady && Object.values(players).filter(p => p.id !== pId && p.isAlive).length === 0 && (
+                                        <div className="text-slate-500 italic text-center py-4">No viable targets found.</div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-500 flex justify-between items-center">
+                            <span>CURRENT ENERGY: <span className="text-yellow-400 font-bold">{energy}</span></span>
+                            {mode && <span className="uppercase text-cyan-400">{mode} MODE</span>}
                         </div>
                     </div>
-                )}
-
-                <div className="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-500 flex justify-between items-center">
-                    <span>CURRENT ENERGY: <span className="text-yellow-400 font-bold">{energy}</span></span>
-                    {mode && <span className="uppercase text-cyan-400">{mode} MODE</span>}
                 </div>
-            </div>
-        </div>
-    );
-}
+            );
+        }
 
         function ActionBtn({ icon: Icon, title, desc, fullDesc, cost, onClick, color = 'cyan' }) {
             const [showHelp, setShowHelp] = useState(false);
