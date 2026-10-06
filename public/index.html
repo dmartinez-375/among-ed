@@ -201,6 +201,45 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
 
         const toInt = (v, fallback, min = 0) => (Number.isInteger(v) && v >= min ? v : fallback);
 
+        // --- Sound effects (synthesized with the Web Audio API, so there's no file to host) ---
+        let audioCtx = null;
+        const getAudioCtx = () => {
+            if (!audioCtx) {
+                const AC = window.AudioContext || window.webkitAudioContext;
+                if (AC) audioCtx = new AC();
+            }
+            return audioCtx;
+        };
+
+        // Six alternating alarm beeps (~1.3s), played on the projector tab only. Browsers only allow sound after the page has been clicked
+        // the page once; App unlocks audio on the first tap (the login button counts).
+        const playMeetingAlarm = () => {
+            try {
+                const ctx = getAudioCtx();
+                if (!ctx) return;
+                if (ctx.state === 'suspended') ctx.resume();
+                const start = ctx.currentTime + 0.05;
+                const master = ctx.createGain();
+                master.gain.value = 0.15;
+                master.connect(ctx.destination);
+                for (let i = 0; i < 6; i++) {
+                    const t = start + i * 0.22;
+                    const osc = ctx.createOscillator();
+                    const g = ctx.createGain();
+                    osc.type = 'square';
+                    osc.frequency.value = i % 2 === 0 ? 880 : 620;
+                    g.gain.setValueAtTime(0, t);
+                    g.gain.linearRampToValueAtTime(1, t + 0.02);
+                    g.gain.setValueAtTime(1, t + 0.16);
+                    g.gain.linearRampToValueAtTime(0, t + 0.2);
+                    osc.connect(g);
+                    g.connect(master);
+                    osc.start(t);
+                    osc.stop(t + 0.21);
+                }
+            } catch (e) { console.log("Alarm sound unavailable", e); }
+        };
+
         const parseCSV = (text) => {
             const rows = [];
             let row = [];
@@ -286,6 +325,19 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                 }
 
                 return onAuthStateChanged(authInst, setUser);
+            }, []);
+
+            // Browsers block sound until the person has interacted with the page; unlock on the first tap.
+            useEffect(() => {
+                const unlock = () => {
+                    try { const c = getAudioCtx(); if (c && c.state === 'suspended') c.resume(); } catch (e) {}
+                };
+                window.addEventListener('pointerdown', unlock, { once: true });
+                window.addEventListener('keydown', unlock, { once: true });
+                return () => {
+                    window.removeEventListener('pointerdown', unlock);
+                    window.removeEventListener('keydown', unlock);
+                };
             }, []);
 
             const handleLogin = async () => {
@@ -427,11 +479,38 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                 return () => { unsubFeed(); unsubGame(); unsubP(); };
             }, [db, paths]);
 
+            // Is sound unlocked on this tab yet? (A freshly opened tab is silent until someone clicks it once.)
+            const [soundOn, setSoundOn] = useState(false);
+            useEffect(() => {
+                const ctx = getAudioCtx();
+                if (!ctx) return;
+                const sync = () => setSoundOn(ctx.state === 'running');
+                sync();
+                ctx.addEventListener('statechange', sync);
+                return () => ctx.removeEventListener('statechange', sync);
+            }, []);
+
+            // Alarm when an emergency meeting starts (only when it goes Game -> Meeting, never on page load)
+            const prevPhaseRef = useRef(null);
+            useEffect(() => {
+                const phase = gameState?.phase;
+                if (phase === 'Meeting' && prevPhaseRef.current === 'Game') playMeetingAlarm();
+                prevPhaseRef.current = phase;
+            }, [gameState?.phase]);
+
             if (gameState?.winner) return <WinScreen winner={gameState.winner} players={players} />;
             if (gameState?.phase === 'Ejecting') return <EjectionSequence data={gameState.ejectionData} isPublic={true} />;
 
             return (
                 <div className="min-h-screen bg-slate-950 text-white p-8">
+                    {!soundOn && (
+                        <button
+                            onClick={() => { try { const c = getAudioCtx(); if (c) c.resume(); } catch (e) {} }}
+                            className="fixed bottom-4 right-4 z-40 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 text-sm px-4 py-2 rounded-full flex items-center gap-2"
+                        >
+                            <VolumeX size={16} /> Click here once to turn on the meeting alarm
+                        </button>
+                    )}
                     <div className="max-w-4xl mx-auto">
                         <div className="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
                             <h1 className="text-4xl font-bold text-cyan-400 flex items-center gap-3"><Radio size={40}/> Sector {classId} Feed</h1>
@@ -462,10 +541,39 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
         // --- Screens & Animations ---
         function WinScreen({ winner, players, onDismiss }) {
             const isImp = winner === 'Imposters';
-            const imposterNames = Object.values(players || {})
-                .filter(p => p.role === 'Imposter')
-                .map(p => p.name)
-                .join(", ");
+            const all = Object.values(players || {});
+            const imposterList = all.filter(p => p.role === 'Imposter').map(p => p.name);
+            const crewList = all.filter(p => p.role === 'Crewmate').map(p => p.name);
+            const imposterNames = imposterList.join(", ");
+
+            const dismissButton = onDismiss && (
+                <button onClick={onDismiss} className="mt-12 bg-slate-700 hover:bg-slate-600 text-white px-6 py-3 rounded-full font-bold text-base">
+                    Back to Mission Control
+                </button>
+            );
+
+            // Teacher ended the game early: show everyone's role
+            if (winner === 'Revealed') {
+                return (
+                    <div className="fixed inset-0 z-50 bg-black text-white text-center overflow-y-auto">
+                        <div className="min-h-full flex flex-col items-center justify-center p-6">
+                            <h1 className="text-5xl md:text-7xl font-black uppercase tracking-widest mb-2">Mission Ended</h1>
+                            <p className="text-slate-400 text-xl mb-8">Here's who everyone was!</p>
+                            <div className="grid md:grid-cols-2 gap-6 w-full max-w-4xl">
+                                <div className="bg-red-950/40 border border-red-700 rounded-2xl p-6">
+                                    <div className="flex items-center justify-center gap-2 text-red-500 font-black uppercase tracking-widest text-2xl mb-3"><Skull size={28}/> Imposters</div>
+                                    <div className="text-3xl font-bold text-white">{imposterList.length ? imposterNames : '-'}</div>
+                                </div>
+                                <div className="bg-cyan-950/40 border border-cyan-700 rounded-2xl p-6">
+                                    <div className="flex items-center justify-center gap-2 text-cyan-400 font-black uppercase tracking-widest text-2xl mb-3"><Shield size={28}/> Crewmates</div>
+                                    <div className="text-2xl font-semibold text-slate-200">{crewList.length ? crewList.join(", ") : '-'}</div>
+                                </div>
+                            </div>
+                            {dismissButton}
+                        </div>
+                    </div>
+                );
+            }
 
             return (
                 <div className={`fixed inset-0 z-50 flex flex-col items-center justify-center bg-black text-center ${isImp ? 'text-red-500' : 'text-cyan-400'}`}>
@@ -477,11 +585,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                             <div className="font-bold mt-2 text-red-500 text-4xl">{imposterNames}</div>
                         </div>
                     )}
-                    {onDismiss && (
-                        <button onClick={onDismiss} className="mt-12 bg-slate-700 hover:bg-slate-600 text-white px-6 py-3 rounded-full font-bold text-base">
-                            Back to Mission Control
-                        </button>
-                    )}
+                    {dismissButton}
                 </div>
             );
         }
@@ -563,12 +667,13 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                     {count > 0 ? (
                         <div className="text-9xl font-black text-white animate-ping">{count}</div>
                     ) : (
-                        <div className="text-center animate-fade-in cursor-pointer p-10 bg-slate-900 border-2 border-slate-700 rounded-2xl shadow-2xl">
-                            <p className="text-slate-400 uppercase tracking-widest mb-4">Your assignment</p>
-                            <h1 className={`text-6xl font-black uppercase mb-8 ${role === 'Imposter' ? 'text-red-500' : 'text-cyan-400'}`}>
+                        // Small on purpose: a student can cover it with one hand so neighbors can't peek
+                        <div className="w-40 text-center cursor-pointer px-3 py-3 bg-slate-900 border border-slate-700 rounded-xl shadow-xl animate-fade-in">
+                            <p className="text-[10px] text-slate-400 uppercase tracking-widest">You are</p>
+                            <h1 className={`text-xl font-black uppercase my-1 ${role === 'Imposter' ? 'text-red-500' : 'text-cyan-400'}`}>
                                 {role}
                             </h1>
-                            <p className="text-sm text-slate-500 animate-pulse">(Click anywhere to begin)</p>
+                            <p className="text-[10px] text-slate-500">Tap to hide</p>
                         </div>
                     )}
                 </div>
@@ -906,7 +1011,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                 }
                 if (absentIds.length) {
                     const names = absentIds.map(id => players[id]?.name || id).join(', ');
-                    if (!confirm(`${absentIds.length} cadet(s) haven't been seen in the last ${PRESENCE_SECONDS / 60} minutes:\n\n${names}\n\nStart without them? They'll be removed from this round. (If you unlock the game later, they can rejoin as Crewmates.)`)) return;
+                    if (!confirm(`${absentIds.length} cadet(s) haven't been seen in the last ${PRESENCE_SECONDS / 60} minutes:\n\n${names}\n\nA sleeping or locked device can look away. If they're here, press Cancel, ask them to wake their screen, and try again in a few seconds.\n\nPress OK to start without them: they'll be removed from this round (if you unlock the game later they can rejoin as Crewmates).`)) return;
                 }
 
                 // FIX #4: sanitize number inputs (empty box / NaN would otherwise break slice())
@@ -931,7 +1036,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                         isAlive: true, investigatedStatus: 'Normal',
                         votes: 0, hasVoted: false
                     });
-                    batch.set(getStatsRef(db, paths, pid), ZERO_STATS);
+                    batch.set(getStatsRef(db, paths, pid), ZERO_STATS, { merge: true }); // merge: keep lastSeen so students still show as online
                 });
 
                 batch.set(getGameRef(db, paths), {
@@ -1000,6 +1105,20 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                 }
             }
 
+            // Teacher ends the game now and every screen reveals all roles
+            const endGameEarly = async () => {
+                if (!confirm("End the game now and reveal everyone's roles?")) return;
+                const imposterNames = Object.values(players).filter(p => p.role === 'Imposter').map(p => p.name).join(', ');
+                try {
+                    await updateDoc(getGameRef(db, paths), { winner: 'Revealed', phase: 'GameOver', ejectionData: deleteField() });
+                    await addDoc(collection(db, ...paths.games, GAME_ID, 'feed'), {
+                        message: `Game ended early by the teacher. The Imposters were: ${imposterNames || 'none'}`,
+                        source: "System",
+                        timestamp: serverTimestamp()
+                    });
+                } catch (e) { alert("Could not end the game: " + e.message); }
+            };
+
             // FIX #1: skip votes are tallied on the game doc and compared against the top player
             const endMeeting = async () => {
                 if (endingRef.current) return;
@@ -1045,7 +1164,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                     ops.push((b) => b.update(getPlayerRef(db, paths, pid), { 
                         role:'Pending', isAlive:true, votes:0, hasVoted:false, investigatedStatus: 'Normal'
                     }));
-                    ops.push((b) => b.set(getStatsRef(db, paths, pid), ZERO_STATS));
+                    ops.push((b) => b.set(getStatsRef(db, paths, pid), ZERO_STATS, { merge: true })); // merge: keep lastSeen
                 });
                 feedSnapshot.forEach((d) => ops.push((b) => b.delete(d.ref)));
 
@@ -1340,6 +1459,9 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                                                         <span className="text-slate-400 uppercase text-xs">Skip votes: </span>
                                                         <span className="font-mono font-bold text-white">{gameState?.skipVotes || 0}</span>
                                                     </div>
+                                                )}
+                                                {!gameState?.winner && (
+                                                    <button onClick={endGameEarly} className="w-full py-2 bg-red-700 hover:bg-red-600 rounded font-bold">End Game &amp; Reveal Roles</button>
                                                 )}
                                                 <button onClick={() => setShowStats(true)} className="w-full py-2 bg-orange-700 hover:bg-orange-600 rounded font-bold">Reset to Lobby</button>
                                             </div>
@@ -1645,6 +1767,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
             const pendingRef = useRef({ energy: 0, correct: 0, incorrect: 0 });
             const [pendingEnergy, setPendingEnergy] = useState(0); // display only
             const noteOpenRef = useRef(false);
+            const beatRef = useRef(() => {}); // set by the heartbeat effect below
             const removedRef = useRef(false); // set if the teacher removed us; stops heartbeats/flushes
             noteOpenRef.current = noteOpen;
 
@@ -1709,7 +1832,11 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                 const unsubG = onSnapshot(getGameRef(db, paths), (s) => {
                     const data = s.data();
                     if (data?.status === 'Active' && prevStatusRef.current === 'Lobby') setShowIntro(true);
-                    if (data?.status === 'Lobby') { pendingRef.current = { energy: 0, correct: 0, incorrect: 0 }; setPendingEnergy(0); }
+                    if (data?.status === 'Lobby') {
+                        pendingRef.current = { energy: 0, correct: 0, incorrect: 0 }; setPendingEnergy(0);
+                        // Game was just reset: check in right away so the teacher sees everyone as online
+                        if (prevStatusRef.current && prevStatusRef.current !== 'Lobby') beatRef.current();
+                    }
                     prevStatusRef.current = data?.status;
                     setGameState(data);
                 });
@@ -1772,6 +1899,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                     if (removedRef.current || document.visibilityState !== 'visible') return;
                     setDoc(getStatsRef(db, paths, pId), { lastSeen: serverTimestamp() }, { merge: true }).catch(() => {});
                 };
+                beatRef.current = beat;
                 const beatId = setInterval(beat, HEARTBEAT_MS);
 
                 const onHide = () => { if (document.visibilityState === 'hidden') flushRef.current(); else beat(); };
@@ -2281,7 +2409,7 @@ Question,Answer 1,Answer 2,Answer 3,Answer 4,Correct Index (1-4)
                         return amt;
                     });
                     if (!amount) { setMsg("Need energy to donate!"); return; }
-                    setMsg(`Donated ${amount}⚡ to ${recipient.name}`);
+                    setMsg(`Donated ${amount}⚡ to the ${targetRole === 'Imposter' ? 'Imposters' : 'Crew'}!`); // never name the recipient: that would reveal their role
                     setTimeout(close, 1500);
                 } catch (e) {
                     flash("Error: " + e.message, 3000);
